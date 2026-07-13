@@ -52,9 +52,12 @@ gate ticks. Same for the timed semaphore waits. See `patches/osal-simulated-time
 
 Measured over 30 s of simulated time, 87 packets, the full cFS app set:
 
-- **The packet stream is exactly reproducible, every run.** Per message: the same count, the same
-  CCSDS sequence deltas, the same lengths. Nothing dropped, duplicated, reordered, or invented.
-- **Tick placement still jitters.** A minority of packets land a tick or two early or late.
+- **The packet stream is exactly reproducible** at short scenarios (6 s), and *usually* at 30 s.
+  Per message: the same count, the same CCSDS sequence deltas, the same lengths.
+- **Tick placement jitters.** A minority of packets land a tick or two early or late.
+- **At 30 s the stream is not yet reliably reproducible** — roughly one run in three differs by a
+  packet or two, because the whole system's phase can slip by a tick and change how many 1 Hz cycles
+  fall inside the window. This is the same intra-tick ordering problem, and it is the open item.
 
 Within a single granted tick, cFE's tasks are *simultaneous* in simulated time — and the **host**
 scheduler decides which of them actually runs first. So *what* the flight software does is
@@ -133,20 +136,44 @@ Recorded because both are the obvious ideas, and both are dead ends.
 kernel must order them? Measured: placement jitter got *worse*. The quiescence poller ends up
 contending with cFS for the same core.
 
-**A cooperative token scheduler is not sufficient either.** `$BESOM_COOP=1` enables one in OSAL
-(shipped, off by default, does not deadlock): only one task runs at a time, and the token passes to
-the lowest-numbered *waiting* task, with task ids fixed by creation order. It does not make runs
-deterministic, and the reason is worth understanding:
+**A cooperative token scheduler is not sufficient either — and the fix for *that* deadlocks.**
+`$BESOM_COOP=1` enables one in OSAL (shipped, off by default). Two rounds:
+
+*Round one — asynchronous readiness.* Only one task runs at a time; the token passes to the
+lowest-numbered *waiting* task, with keys from OSAL task ids (creation order, fixed by the startup
+script). It boots and does not deadlock, but it does not make runs deterministic:
 
 > The token only orders the tasks **already waiting for it**. When a tick wakes several tasks, each
 > becomes a waiter whenever its thread happens to get scheduled off its semaphore — so a
 > high-numbered task that wakes fast can take the token before a low-numbered task has even arrived
 > to ask for it. **Readiness is still observed asynchronously.** The race moved; it did not go away.
 
-To actually fix it, OSAL's blocking primitives have to be reimplemented *on top of* the scheduler:
-the task that performs a `give` must mark the receiver ready **at that instant**, rather than the
-receiver marking itself ready whenever Linux gets round to waking it. That is a real rewrite of the
-POSIX layer's semaphores and queues, and it is the honest next step.
+*Round two — synchronous readiness.* The blocking primitives were reimplemented **on top of** the
+scheduler: semaphores and queues never pend in the kernel, they poll and park on a coop channel, and
+the task performing the `give`/`put` marks the receiver ready **at that instant, while holding the
+token**. Timer callbacks give semaphores, so this is the path by which a tick makes tasks runnable.
+Task delays sleep on the schedule and are expired by the tick thread.
+
+This is, I believe, the right design. **It deadlocks during boot**, and the diagnostic says exactly
+why:
+
+```
+COOP-STALL: key=65539 waiting. running=1 holder=65538
+   task key=0     ready=0 chan=(nil) ext=1     <- tick thread, pending on the harness
+   task key=65537 ready=1 chan=(nil) ext=0     <- runnable, cannot run
+   task key=65538 ready=1 chan=(nil) ext=0     <- HOLDS THE TOKEN, and is itself blocked
+   task key=65539 ready=1 chan=(nil) ext=0     <- runnable, cannot run
+```
+
+A task **holds the token and then blocks on something that is not a coop channel** — one of OSAL's
+own internal mutexes. Its owner has meanwhile parked on a coop channel, giving up the token but not
+the mutex. Synchronous readiness does not help, because the stall is in OSAL's *locking*, one layer
+below the scheduler.
+
+So the remaining work is not "wake tasks in order" — that part is done. It is to integrate the token
+with OSAL's internal locking, so that no task can hold the token across an internal lock that
+another task may hold across a block. That is the honest next step, and it is a bigger change than
+it sounds.
 
 ## The dynamics
 

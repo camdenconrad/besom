@@ -1,5 +1,5 @@
 diff --git a/src/os/posix/src/os-impl-binsem.c b/src/os/posix/src/os-impl-binsem.c
-index 996f61c2..93aaa0d4 100644
+index 996f61c2..fdbfe706 100644
 --- a/src/os/posix/src/os-impl-binsem.c
 +++ b/src/os/posix/src/os-impl-binsem.c
 @@ -31,6 +31,7 @@
@@ -10,7 +10,63 @@ index 996f61c2..93aaa0d4 100644
  #include "os-shared-binsem.h"
  #include "os-impl-binsem.h"
  
-@@ -458,6 +459,37 @@ int32 OS_BinSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
+@@ -316,6 +317,9 @@ int32 OS_BinSemGive_Impl(const OS_object_token_t *token)
+ 
+     pthread_mutex_unlock(&(sem->id));
+ 
++    /* Readiness is established by the GIVER, while it holds the token. */
++    OS_Coop_Wake_Impl(&sem->cv);
++
+     return OS_SUCCESS;
+ }
+ 
+@@ -348,6 +352,9 @@ int32 OS_BinSemFlush_Impl(const OS_object_token_t *token)
+ 
+     pthread_mutex_unlock(&(sem->id));
+ 
++    /* Readiness is established by the GIVER, while it holds the token. */
++    OS_Coop_Wake_Impl(&sem->cv);
++
+     return OS_SUCCESS;
+ }
+ 
+@@ -445,6 +452,35 @@ static int32 OS_GenericBinSemTake_Impl(const OS_object_token_t *token, const str
+  *-----------------------------------------------------------------*/
+ int32 OS_BinSemTake_Impl(const OS_object_token_t *token)
+ {
++    OS_impl_binsem_internal_record_t *sem;
++    struct timespec                   now;
++    int32                             status;
++
++    /*
++     * Under the cooperative scheduler, never pend in the kernel: this thread would
++     * vanish from the scheduler's view and its wakeup order would be Linux's
++     * business again. A zeroed (already-expired) timespec makes the generic take a
++     * non-blocking check, so poll and park on the coop channel instead -- from
++     * which only a giver (or a flush) can release us.
++     */
++    if (OS_Coop_InSched_Impl())
++    {
++        sem = OS_OBJECT_TABLE_GET(OS_impl_bin_sem_table, *token);
++
++        for (;;)
++        {
++            memset(&now, 0, sizeof(now));
++
++            status = OS_GenericBinSemTake_Impl(token, &now);
++            if (status != OS_SEM_TIMEOUT)
++            {
++                return status;
++            }
++
++            OS_Coop_Block_Impl(&sem->cv);
++        }
++    }
++
+     return (OS_GenericBinSemTake_Impl(token, NULL));
+ }
+ 
+@@ -458,6 +494,44 @@ int32 OS_BinSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
  {
      struct timespec ts;
  
@@ -41,7 +97,14 @@ index 996f61c2..93aaa0d4 100644
 +                return OS_SEM_TIMEOUT;
 +            }
 +
-+            OS_SimTime_WaitTick_Impl(deadline);
++            if (OS_Coop_InSched_Impl())
++            {
++                OS_Coop_BlockUntil_Impl(&OS_OBJECT_TABLE_GET(OS_impl_bin_sem_table, *token)->cv, deadline);
++            }
++            else
++            {
++                OS_SimTime_WaitTick_Impl(deadline);
++            }
 +        }
 +    }
 +
@@ -49,7 +112,7 @@ index 996f61c2..93aaa0d4 100644
       ** Compute an absolute time for the delay
       */
 diff --git a/src/os/posix/src/os-impl-countsem.c b/src/os/posix/src/os-impl-countsem.c
-index dfa8770e..020d850a 100644
+index dfa8770e..42b3734c 100644
 --- a/src/os/posix/src/os-impl-countsem.c
 +++ b/src/os/posix/src/os-impl-countsem.c
 @@ -31,6 +31,7 @@
@@ -60,7 +123,54 @@ index dfa8770e..020d850a 100644
  
  /*
   * Added SEM_VALUE_MAX Define
-@@ -164,6 +165,38 @@ int32 OS_CountSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
+@@ -127,6 +128,17 @@ int32 OS_CountSemGive_Impl(const OS_object_token_t *token)
+         return OS_SEM_FAILURE;
+     }
+ 
++    /*
++     * Mark the waiter runnable HERE, while we still hold the token.
++     *
++     * This is the difference between a cooperative scheduler that works and one
++     * that does not: readiness is established by the giver, at a defined point in
++     * the schedule, rather than by the receiver whenever Linux happens to wake its
++     * thread. Timer callbacks give this semaphore, so this is the path by which a
++     * tick makes tasks runnable.
++     */
++    OS_Coop_Wake_Impl(&impl->id);
++
+     return OS_SUCCESS;
+ }
+ 
+@@ -142,6 +154,28 @@ int32 OS_CountSemTake_Impl(const OS_object_token_t *token)
+ 
+     impl = OS_OBJECT_TABLE_GET(OS_impl_count_sem_table, *token);
+ 
++    /*
++     * Under the cooperative scheduler we must never block in the kernel: doing so
++     * would take this thread out of the scheduler's sight, and its wakeup order
++     * would be Linux's business again. Poll instead, and park on the coop channel
++     * -- from which only a giver can release us.
++     */
++    if (OS_Coop_InSched_Impl())
++    {
++        for (;;)
++        {
++            if (sem_trywait(&impl->id) == 0)
++            {
++                return OS_SUCCESS;
++            }
++            if (errno != EAGAIN && errno != EINTR)
++            {
++                return OS_SEM_FAILURE;
++            }
++            OS_Coop_Block_Impl(&impl->id);
++        }
++    }
++
+     if (sem_wait(&impl->id) < 0)
+     {
+         return OS_SEM_FAILURE;
+@@ -164,6 +198,47 @@ int32 OS_CountSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
  
      impl = OS_OBJECT_TABLE_GET(OS_impl_count_sem_table, *token);
  
@@ -92,7 +202,16 @@ index dfa8770e..020d850a 100644
 +                return OS_SEM_TIMEOUT;
 +            }
 +
-+            OS_SimTime_WaitTick_Impl(deadline);
++            if (OS_Coop_InSched_Impl())
++            {
++                /* Woken by a give, or by the tick thread at the deadline -- both
++                 * synchronous, so the timeout is not a race either. */
++                OS_Coop_BlockUntil_Impl(&impl->id, deadline);
++            }
++            else
++            {
++                OS_SimTime_WaitTick_Impl(deadline);
++            }
 +        }
 +    }
 +
@@ -100,7 +219,7 @@ index dfa8770e..020d850a 100644
       ** Compute an absolute time for the delay
       */
 diff --git a/src/os/posix/src/os-impl-queues.c b/src/os/posix/src/os-impl-queues.c
-index 562abebb..49c8728a 100644
+index 562abebb..43028966 100644
 --- a/src/os/posix/src/os-impl-queues.c
 +++ b/src/os/posix/src/os-impl-queues.c
 @@ -33,6 +33,7 @@
@@ -111,7 +230,44 @@ index 562abebb..49c8728a 100644
  
  /* Tables where the OS object information is stored */
  OS_impl_queue_internal_record_t OS_impl_queue_table[OS_MAX_QUEUES];
-@@ -222,21 +223,67 @@ int32 OS_QueueGet_Impl(const OS_object_token_t *token, void *data, size_t size,
+@@ -198,7 +199,35 @@ int32 OS_QueueGet_Impl(const OS_object_token_t *token, void *data, size_t size,
+      ** Read the message queue for data
+      */
+     sizeCopied = -1;
+-    if (timeout == OS_PEND)
++    if (timeout == OS_PEND && OS_Coop_InSched_Impl())
++    {
++        /*
++         * Under the cooperative scheduler, never pend in mq_receive: this thread
++         * would leave the scheduler's view and its wakeup order would be Linux's
++         * business again. Poll with an already-expired timeout, and park on the
++         * coop channel -- from which only a QueuePut can release us.
++         *
++         * This is the software bus's main path: every SB message a task waits for
++         * arrives here, so this is where task wakeup ORDER is actually decided.
++         */
++        memset(&ts, 0, sizeof(ts));
++
++        for (;;)
++        {
++            do
++            {
++                sizeCopied = mq_timedreceive(impl->id, data, size, NULL, &ts);
++            } while (sizeCopied < 0 && errno == EINTR);
++
++            if (sizeCopied >= 0 || errno != ETIMEDOUT)
++            {
++                break;
++            }
++
++            OS_Coop_Block_Impl(impl);
++        }
++    }
++    else if (timeout == OS_PEND)
+     {
+         /*
+          ** A signal can interrupt the mq_receive call, so the call has to be done with
+@@ -222,21 +251,74 @@ int32 OS_QueueGet_Impl(const OS_object_token_t *token, void *data, size_t size,
           */
          if (timeout == OS_CHECK)
          {
@@ -120,7 +276,7 @@ index 562abebb..49c8728a 100644
 +             * past, so mq_timedreceive returns immediately -- with the message
 +             * if one is queued, ETIMEDOUT if not.
 +             */
-             memset(&ts, 0, sizeof(ts));
++            memset(&ts, 0, sizeof(ts));
 +
 +            sizeCopied = mq_timedreceive(impl->id, data, size, NULL, &ts);
 +        }
@@ -141,7 +297,7 @@ index 562abebb..49c8728a 100644
 +             */
 +            unsigned long long deadline = OS_SimTime_GetUsec_Impl() + (unsigned long long)timeout * 1000;
 +
-+            memset(&ts, 0, sizeof(ts));
+             memset(&ts, 0, sizeof(ts));
 +
 +            for (;;)
 +            {
@@ -160,7 +316,14 @@ index 562abebb..49c8728a 100644
 +                    break; /* simulated timeout expired; errno stays ETIMEDOUT */
 +                }
 +
-+                OS_SimTime_WaitTick_Impl(deadline);
++                if (OS_Coop_InSched_Impl())
++                {
++                    OS_Coop_BlockUntil_Impl(impl, deadline);
++                }
++                else
++                {
++                    OS_SimTime_WaitTick_Impl(deadline);
++                }
 +            }
          }
          else
@@ -188,11 +351,24 @@ index 562abebb..49c8728a 100644
  
      } /* END timeout */
  
+@@ -319,5 +401,12 @@ int32 OS_QueuePut_Impl(const OS_object_token_t *token, const void *data, size_t
+         return_code = OS_ERROR;
+     }
+ 
++    /*
++     * Wake the receiver HERE, while we still hold the token -- readiness is
++     * established by the sender, at a defined point in the schedule, not by the
++     * receiver whenever Linux gets round to waking its thread.
++     */
++    OS_Coop_Wake_Impl(impl);
++
+     return return_code;
+ }
 diff --git a/src/os/posix/src/os-impl-tasks.c b/src/os/posix/src/os-impl-tasks.c
-index a7d9cb46..e9e65165 100644
+index a7d9cb46..74662a50 100644
 --- a/src/os/posix/src/os-impl-tasks.c
 +++ b/src/os/posix/src/os-impl-tasks.c
-@@ -748,11 +748,270 @@ void OS_TaskExit_Impl(void)
+@@ -748,11 +748,551 @@ void OS_TaskExit_Impl(void)
   *           See prototype for argument/return detail
   *
   *-----------------------------------------------------------------*/
@@ -268,25 +444,44 @@ index a7d9cb46..e9e65165 100644
 + * whole flight software rather than merely perturb it. Opt-in keeps that risk
 + * away from ordinary runs.
 + */
-+#define OS_COOP_MAX_WAITERS 64
++#define OS_COOP_MAX_TASKS 64
++
++/*
++ * A task's place in the deterministic schedule.
++ *
++ * `ready` is the load-bearing field. It is set by WHOEVER WAKES THE TASK, at the
++ * instant it wakes it, while that waker holds the token. The earlier design let a
++ * task mark itself ready when its thread happened to come off a semaphore -- which
++ * meant a fast-waking high-numbered task could take the token before a
++ * low-numbered task had even arrived to ask for it. Readiness was observed
++ * asynchronously, so the race moved rather than disappearing.
++ */
++typedef struct
++{
++    bool               used;
++    uint32             key;       /* OSAL task id: creation order, fixed by the startup script */
++    bool               ready;     /* eligible to run */
++    const void        *chan;      /* the object it is blocked on, NULL if runnable */
++    bool               external;  /* pending on something outside the simulation (a host socket) */
++    unsigned long long wake_usec; /* simulated deadline, 0 if none */
++} OS_Coop_Task_t;
 +
 +static struct
 +{
 +    pthread_mutex_t mutex;
 +    pthread_cond_t  cond;
 +    bool            enabled;
-+    bool            held;
-+    uint32          waiters[OS_COOP_MAX_WAITERS];
-+    uint32          n_waiters;
-+} OS_Coop = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, false, false, {0}, 0};
++    bool            running;     /* somebody holds the token */
++    uint32          running_key;
++    OS_Coop_Task_t  tasks[OS_COOP_MAX_TASKS];
++} OS_Coop = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, false, false, 0, {{0}}};
 +
-+/* This thread's place in the deterministic order. Lower goes first. */
-+static __thread uint32 OS_Coop_Key = 0;
-+static __thread bool   OS_Coop_Joined = false;
++static __thread OS_Coop_Task_t *OS_Coop_Self = NULL;
 +
 +void OS_Coop_Init_Impl(void)
 +{
 +    const char *env = getenv("BESOM_COOP");
++
 +    OS_Coop.enabled = (env != NULL && env[0] == '1');
 +
 +    if (OS_Coop.enabled)
@@ -300,86 +495,334 @@ index a7d9cb46..e9e65165 100644
 +    return OS_Coop.enabled;
 +}
 +
-+static bool OS_Coop_IsNext(uint32 key)
++/*
++ * True only for a thread that has actually JOINED the schedule.
++ *
++ * The distinction matters: cFE's main thread is not an OSAL task, so it never
++ * joins. If it took the cooperative paths, its Block would be a no-op and it
++ * would spin forever instead of pending -- which is exactly what deadlocked boot
++ * the first time. Threads outside the schedule must keep using the ordinary
++ * blocking primitives.
++ */
++bool OS_Coop_InSched_Impl(void)
++{
++    return OS_Coop.enabled && OS_Coop_Self != NULL;
++}
++
++/* Caller holds the lock. Is `me` the lowest-keyed task that could run? */
++static bool OS_Coop_MayRun(const OS_Coop_Task_t *me)
 +{
 +    uint32 i;
 +
-+    for (i = 0; i < OS_Coop.n_waiters; ++i)
++    if (OS_Coop.running || !me->ready)
 +    {
-+        if (OS_Coop.waiters[i] < key)
++        return false;
++    }
++
++    for (i = 0; i < OS_COOP_MAX_TASKS; ++i)
++    {
++        const OS_Coop_Task_t *t = &OS_Coop.tasks[i];
++
++        if (t->used && t->ready && t->key < me->key)
 +        {
-+            return false; /* someone earlier in the order is waiting */
++            return false; /* someone earlier in the order can run */
 +        }
 +    }
++
 +    return true;
 +}
 +
-+/* Take the token. Blocks until it is free AND we are the lowest waiter. */
-+void OS_Coop_Acquire_Impl(void)
++/* Caller holds the lock. Park until it is our turn, then take the token. */
++static void OS_Coop_TakeToken(OS_Coop_Task_t *me)
 +{
-+    if (!OS_Coop.enabled || !OS_Coop_Joined)
-+    {
-+        return;
-+    }
++    struct timespec deadline;
++    int             rc = 0;
 +
-+    pthread_mutex_lock(&OS_Coop.mutex);
-+
-+    if (OS_Coop.n_waiters < OS_COOP_MAX_WAITERS)
++    while (!OS_Coop_MayRun(me))
 +    {
-+        OS_Coop.waiters[OS_Coop.n_waiters++] = OS_Coop_Key;
-+    }
++        /* BESOM DIAGNOSTIC: if we wait a long time, say who is holding the token
++         * and what everyone else is doing. A cooperative scheduler that stalls is
++         * otherwise completely opaque. */
++        clock_gettime(CLOCK_REALTIME, &deadline);
++        deadline.tv_sec += 3;
 +
-+    while (OS_Coop.held || !OS_Coop_IsNext(OS_Coop_Key))
-+    {
-+        pthread_cond_wait(&OS_Coop.cond, &OS_Coop.mutex);
-+    }
++        rc = pthread_cond_timedwait(&OS_Coop.cond, &OS_Coop.mutex, &deadline);
 +
-+    /* Remove ourselves from the waiting set. */
-+    for (uint32 i = 0; i < OS_Coop.n_waiters; ++i)
-+    {
-+        if (OS_Coop.waiters[i] == OS_Coop_Key)
++        if (rc == ETIMEDOUT)
 +        {
-+            OS_Coop.waiters[i] = OS_Coop.waiters[--OS_Coop.n_waiters];
-+            break;
++            uint32 i;
++            printf("COOP-STALL: key=%lu waiting. running=%d holder=%lu\n", (unsigned long)me->key,
++                   (int)OS_Coop.running, (unsigned long)OS_Coop.running_key);
++            for (i = 0; i < OS_COOP_MAX_TASKS; ++i)
++            {
++                if (OS_Coop.tasks[i].used)
++                {
++                    printf("   task key=%lu ready=%d chan=%p ext=%d wake=%llu\n",
++                           (unsigned long)OS_Coop.tasks[i].key, (int)OS_Coop.tasks[i].ready,
++                           OS_Coop.tasks[i].chan, (int)OS_Coop.tasks[i].external,
++                           OS_Coop.tasks[i].wake_usec);
++                }
++            }
++            fflush(stdout);
 +        }
 +    }
 +
-+    OS_Coop.held = true;
-+    pthread_mutex_unlock(&OS_Coop.mutex);
++    OS_Coop.running     = true;
++    OS_Coop.running_key = me->key;
 +}
 +
-+/* Give up the token -- called before any blocking operation. */
-+void OS_Coop_Release_Impl(void)
++void OS_Coop_Acquire_Impl(void)
 +{
-+    if (!OS_Coop.enabled || !OS_Coop_Joined)
++    if (!OS_Coop.enabled || OS_Coop_Self == NULL)
 +    {
 +        return;
 +    }
 +
 +    pthread_mutex_lock(&OS_Coop.mutex);
-+    OS_Coop.held = false;
++    OS_Coop_Self->ready = true;
++    OS_Coop_TakeToken(OS_Coop_Self);
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++void OS_Coop_Release_Impl(void)
++{
++    if (!OS_Coop.enabled || OS_Coop_Self == NULL)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++    OS_Coop.running = false;
 +    pthread_cond_broadcast(&OS_Coop.cond);
 +    pthread_mutex_unlock(&OS_Coop.mutex);
 +}
 +
-+/*
-+ * Join the scheduler with a fixed place in the order.
-+ *
-+ * `key` must be stable across runs: it is what makes the execution order
-+ * reproducible. OSAL task ids are assigned in creation order, which the startup
-+ * script fixes, so they serve.
-+ */
 +void OS_Coop_Join_Impl(uint32 key)
 +{
++    uint32 i;
++
 +    if (!OS_Coop.enabled)
 +    {
 +        return;
 +    }
 +
-+    OS_Coop_Key    = key;
-+    OS_Coop_Joined = true;
++    pthread_mutex_lock(&OS_Coop.mutex);
 +
-+    OS_Coop_Acquire_Impl();
++    for (i = 0; i < OS_COOP_MAX_TASKS; ++i)
++    {
++        if (!OS_Coop.tasks[i].used)
++        {
++            OS_Coop.tasks[i].used      = true;
++            OS_Coop.tasks[i].key       = key;
++            OS_Coop.tasks[i].ready     = true;
++            OS_Coop.tasks[i].chan      = NULL;
++            OS_Coop.tasks[i].external  = false;
++            OS_Coop.tasks[i].wake_usec = 0;
++            OS_Coop_Self               = &OS_Coop.tasks[i];
++            break;
++        }
++    }
++
++    if (OS_Coop_Self != NULL)
++    {
++        OS_Coop_TakeToken(OS_Coop_Self);
++    }
++
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++/*
++ * Block on `chan` until somebody wakes us.
++ *
++ * We go NOT-READY and give up the token in one atomic step, so a waker cannot
++ * miss us: it either sees us blocked on `chan` (and marks us ready), or we have
++ * not blocked yet and will re-test the condition under the same lock.
++ */
++void OS_Coop_Block_Impl(const void *chan)
++{
++    if (!OS_Coop.enabled || OS_Coop_Self == NULL)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++
++    OS_Coop_Self->ready = false;
++    OS_Coop_Self->chan  = chan;
++    OS_Coop.running     = false;
++    pthread_cond_broadcast(&OS_Coop.cond);
++
++    /* Wait to be made ready BY SOMEONE ELSE -- that is the whole point. */
++    while (!OS_Coop_Self->ready)
++    {
++        pthread_cond_wait(&OS_Coop.cond, &OS_Coop.mutex);
++    }
++
++    OS_Coop_Self->chan = NULL;
++    OS_Coop_TakeToken(OS_Coop_Self);
++
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++/*
++ * Block on `chan`, but no later than a simulated deadline.
++ *
++ * Woken by either OS_Coop_Wake_Impl(chan) -- someone gave the thing we want -- or
++ * by the tick thread when simulated time reaches the deadline. A timed wait needs
++ * both, and both must be synchronous, or the timeout itself becomes a race.
++ */
++void OS_Coop_BlockUntil_Impl(const void *chan, unsigned long long wake_usec)
++{
++    if (!OS_Coop.enabled || OS_Coop_Self == NULL)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++
++    OS_Coop_Self->ready     = false;
++    OS_Coop_Self->chan      = chan;
++    OS_Coop_Self->wake_usec = wake_usec;
++    OS_Coop.running         = false;
++    pthread_cond_broadcast(&OS_Coop.cond);
++
++    while (!OS_Coop_Self->ready)
++    {
++        pthread_cond_wait(&OS_Coop.cond, &OS_Coop.mutex);
++    }
++
++    OS_Coop_Self->chan      = NULL;
++    OS_Coop_Self->wake_usec = 0;
++    OS_Coop_TakeToken(OS_Coop_Self);
++
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++/*
++ * Wake everything blocked on `chan`, right now.
++ *
++ * Called by the task performing the give/put, while it still holds the token. The
++ * woken tasks become runnable at a defined instant in the schedule; which of them
++ * actually runs next is then decided by key order, not by Linux.
++ */
++void OS_Coop_Wake_Impl(const void *chan)
++{
++    uint32 i;
++
++    if (!OS_Coop.enabled)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++
++    for (i = 0; i < OS_COOP_MAX_TASKS; ++i)
++    {
++        OS_Coop_Task_t *t = &OS_Coop.tasks[i];
++
++        if (t->used && !t->ready && t->chan == chan)
++        {
++            t->ready = true;
++            t->chan  = NULL;
++        }
++    }
++
++    pthread_cond_broadcast(&OS_Coop.cond);
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++/*
++ * Sleep until simulated time reaches `wake_usec`.
++ *
++ * The tick thread wakes us (see OS_Coop_WakeDelays_Impl) as part of advancing the
++ * clock, so a delay expires at a defined point in the schedule rather than
++ * whenever the host clock happens to fire.
++ */
++void OS_Coop_DelayUntil_Impl(unsigned long long wake_usec)
++{
++    if (!OS_Coop.enabled || OS_Coop_Self == NULL)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++
++    OS_Coop_Self->ready     = false;
++    OS_Coop_Self->wake_usec = wake_usec;
++    OS_Coop.running         = false;
++    pthread_cond_broadcast(&OS_Coop.cond);
++
++    while (!OS_Coop_Self->ready)
++    {
++        pthread_cond_wait(&OS_Coop.cond, &OS_Coop.mutex);
++    }
++
++    OS_Coop_Self->wake_usec = 0;
++    OS_Coop_TakeToken(OS_Coop_Self);
++
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++/* Called by the tick thread after it advances simulated time. */
++void OS_Coop_WakeDelays_Impl(unsigned long long now_usec)
++{
++    uint32 i;
++
++    if (!OS_Coop.enabled)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++
++    for (i = 0; i < OS_COOP_MAX_TASKS; ++i)
++    {
++        OS_Coop_Task_t *t = &OS_Coop.tasks[i];
++
++        if (t->used && !t->ready && t->wake_usec != 0 && now_usec >= t->wake_usec)
++        {
++            t->ready     = true;
++            t->wake_usec = 0;
++        }
++    }
++
++    pthread_cond_broadcast(&OS_Coop.cond);
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++/*
++ * Pending on something OUTSIDE the simulation -- a host socket, or the harness
++ * itself. Such a task must not merely give up the token: it must leave the ready
++ * set entirely, or the scheduler would keep picking it and stall waiting for a
++ * task that cannot proceed.
++ */
++void OS_Coop_ExternalBegin_Impl(void)
++{
++    if (!OS_Coop.enabled || OS_Coop_Self == NULL)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++    OS_Coop_Self->ready    = false;
++    OS_Coop_Self->external = true;
++    OS_Coop.running        = false;
++    pthread_cond_broadcast(&OS_Coop.cond);
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++void OS_Coop_ExternalEnd_Impl(void)
++{
++    if (!OS_Coop.enabled || OS_Coop_Self == NULL)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++    OS_Coop_Self->external = false;
++    OS_Coop_Self->ready    = true;
++    OS_Coop_TakeToken(OS_Coop_Self);
++    pthread_mutex_unlock(&OS_Coop.mutex);
 +}
 +
 +/*
@@ -449,7 +892,21 @@ index a7d9cb46..e9e65165 100644
 +        if (OS_SimTime.active)
 +        {
 +            unsigned long long deadline = OS_SimTime.usec + (unsigned long long)millisecond * 1000;
++            pthread_mutex_unlock(&OS_SimTime.mutex);
 +
++            if (OS_Coop_InSched_Impl())
++            {
++                /* Sleep on the SCHEDULE: the tick thread expires us at the
++                 * deadline, holding the token, so the wakeup lands at a defined
++                 * point rather than whenever this thread gets scheduled. */
++                while (OS_SimTime_GetUsec_Impl() < deadline)
++                {
++                    OS_Coop_DelayUntil_Impl(deadline);
++                }
++                return OS_SUCCESS;
++            }
++
++            pthread_mutex_lock(&OS_SimTime.mutex);
 +            while (OS_SimTime.usec < deadline)
 +            {
 +                pthread_cond_wait(&OS_SimTime.cond, &OS_SimTime.mutex);
@@ -463,8 +920,32 @@ index a7d9cb46..e9e65165 100644
      clock_gettime(CLOCK_MONOTONIC, &sleep_end);
      sleep_end.tv_sec  += millisecond / 1000;
      sleep_end.tv_nsec += 1000000 * (millisecond % 1000);
+@@ -763,11 +1303,23 @@ int32 OS_TaskDelay_Impl(uint32 millisecond)
+         ++sleep_end.tv_sec;
+     }
+ 
++    /*
++     * A real sleep must GIVE UP THE TOKEN.
++     *
++     * Holding it across a host sleep stalls every other task for the duration --
++     * and cFS's HS app sleeps in a loop, so boot simply never finishes. Anything
++     * that blocks on the host, rather than on the simulation, has to leave the
++     * ready set.
++     */
++    OS_Coop_ExternalBegin_Impl();
++
+     do
+     {
+         status = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &sleep_end, NULL);
+     } while (status == EINTR);
+ 
++    OS_Coop_ExternalEnd_Impl();
++
+     if (status != 0)
+     {
+         return OS_ERROR;
 diff --git a/src/os/shared/inc/os-shared-timebase.h b/src/os/shared/inc/os-shared-timebase.h
-index 5ee19111..5d3733c6 100644
+index 5ee19111..6e30cd19 100644
 --- a/src/os/shared/inc/os-shared-timebase.h
 +++ b/src/os/shared/inc/os-shared-timebase.h
 @@ -33,6 +33,7 @@ typedef struct
@@ -475,7 +956,7 @@ index 5ee19111..5d3733c6 100644
      uint32         accuracy_usec;
      osal_id_t      first_cb;
      uint32         freerun_time;
-@@ -40,6 +41,70 @@ typedef struct
+@@ -40,6 +41,123 @@ typedef struct
      uint32         nominal_interval_time;
  } OS_timebase_internal_record_t;
  
@@ -513,9 +994,28 @@ index 5ee19111..5d3733c6 100644
 + */
 +void OS_Coop_Init_Impl(void);
 +bool OS_Coop_Enabled_Impl(void);
++bool OS_Coop_InSched_Impl(void);
 +void OS_Coop_Join_Impl(uint32 key);
 +void OS_Coop_Acquire_Impl(void);
 +void OS_Coop_Release_Impl(void);
++
++/* Block on an object until somebody wakes us. */
++void OS_Coop_Block_Impl(const void *chan);
++void OS_Coop_BlockUntil_Impl(const void *chan, unsigned long long wake_usec);
++
++/* Wake everything blocked on an object -- called by the GIVER, holding the token.
++ * This is what makes readiness synchronous, and it is the whole trick. */
++void OS_Coop_Wake_Impl(const void *chan);
++
++/* Sleep until simulated time reaches a deadline; the tick thread wakes us. */
++void OS_Coop_DelayUntil_Impl(unsigned long long wake_usec);
++void OS_Coop_WakeDelays_Impl(unsigned long long now_usec);
++
++/* Pending on something outside the simulation (a host socket). Such a task must
++ * leave the ready set entirely, or the scheduler stalls waiting for a task that
++ * cannot proceed. */
++void OS_Coop_ExternalBegin_Impl(void);
++void OS_Coop_ExternalEnd_Impl(void);
 +
 +/*
 + * Weak no-op fallbacks, defined per translation unit.
@@ -527,27 +1027,61 @@ index 5ee19111..5d3733c6 100644
 + * real POSIX implementations override these wherever they are present.
 + */
 +__attribute__((weak)) void OS_Coop_Init_Impl(void) {}
++__attribute__((weak)) bool OS_Coop_InSched_Impl(void)
++{
++    return false;
++}
 +__attribute__((weak)) void OS_Coop_Join_Impl(uint32 key)
 +{
 +    (void)key;
 +}
 +__attribute__((weak)) void OS_Coop_Acquire_Impl(void) {}
 +__attribute__((weak)) void OS_Coop_Release_Impl(void) {}
++__attribute__((weak)) void OS_Coop_Block_Impl(const void *chan)
++{
++    (void)chan;
++}
++__attribute__((weak)) void OS_Coop_BlockUntil_Impl(const void *chan, unsigned long long wake_usec)
++{
++    (void)chan;
++    (void)wake_usec;
++}
++__attribute__((weak)) void OS_Coop_Wake_Impl(const void *chan)
++{
++    (void)chan;
++}
++__attribute__((weak)) void OS_Coop_DelayUntil_Impl(unsigned long long wake_usec)
++{
++    (void)wake_usec;
++}
++__attribute__((weak)) void OS_Coop_WakeDelays_Impl(unsigned long long now_usec)
++{
++    (void)now_usec;
++}
++__attribute__((weak)) void OS_Coop_ExternalBegin_Impl(void) {}
++__attribute__((weak)) void OS_Coop_ExternalEnd_Impl(void) {}
 +
-+/** RAII-ish helper: bracket a blocking call so the token is always given up. */
-+#define OS_COOP_BLOCKING(expr)     \
-+    do                             \
-+    {                              \
-+        OS_Coop_Release_Impl();    \
-+        (expr);                    \
-+        OS_Coop_Acquire_Impl();    \
++/**
++ * Bracket a call that pends on something OUTSIDE the simulation -- a host socket,
++ * or the harness itself. The task leaves the ready set for the duration.
++ *
++ * Do NOT use this for semaphores or queues: those are woken from inside the
++ * simulation, and must go through OS_Coop_Block_Impl / OS_Coop_Wake_Impl so that
++ * readiness is established by the waker at a defined point in the schedule.
++ */
++#define OS_COOP_EXTERNAL(expr)        \
++    do                                \
++    {                                 \
++        OS_Coop_ExternalBegin_Impl(); \
++        (expr);                       \
++        OS_Coop_ExternalEnd_Impl();   \
 +    } while (0)
 +
  /*
   * These record types have extra information with each entry.  These tables are used
   * to share extra data between the common layer and the OS-specific implementation.
 diff --git a/src/os/shared/src/osapi-binsem.c b/src/os/shared/src/osapi-binsem.c
-index 726694e4..5656e914 100644
+index 726694e4..07ba27c7 100644
 --- a/src/os/shared/src/osapi-binsem.c
 +++ b/src/os/shared/src/osapi-binsem.c
 @@ -38,6 +38,7 @@
@@ -558,24 +1092,6 @@ index 726694e4..5656e914 100644
  
  /*
   * Sanity checks on the user-supplied configuration
-@@ -197,7 +198,7 @@ int32 OS_BinSemTake(osal_id_t sem_id)
-     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_NONE, LOCAL_OBJID_TYPE, sem_id, &token);
-     if (return_code == OS_SUCCESS)
-     {
--        return_code = OS_BinSemTake_Impl(&token);
-+        OS_COOP_BLOCKING(return_code = OS_BinSemTake_Impl(&token));
-     }
- 
-     return return_code;
-@@ -218,7 +219,7 @@ int32 OS_BinSemTimedWait(osal_id_t sem_id, uint32 msecs)
-     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_NONE, LOCAL_OBJID_TYPE, sem_id, &token);
-     if (return_code == OS_SUCCESS)
-     {
--        return_code = OS_BinSemTimedWait_Impl(&token, msecs);
-+        OS_COOP_BLOCKING(return_code = OS_BinSemTimedWait_Impl(&token, msecs));
-     }
- 
-     return return_code;
 diff --git a/src/os/shared/src/osapi-common.c b/src/os/shared/src/osapi-common.c
 index 7f2c397f..dbdab068 100644
 --- a/src/os/shared/src/osapi-common.c
@@ -591,7 +1107,7 @@ index 7f2c397f..dbdab068 100644
      osal_objtype_t idtype;
      uint32         microSecPerSec;
 diff --git a/src/os/shared/src/osapi-countsem.c b/src/os/shared/src/osapi-countsem.c
-index b1ac5e63..d4fc87e6 100644
+index b1ac5e63..64086116 100644
 --- a/src/os/shared/src/osapi-countsem.c
 +++ b/src/os/shared/src/osapi-countsem.c
 @@ -38,6 +38,7 @@
@@ -602,26 +1118,8 @@ index b1ac5e63..d4fc87e6 100644
  
  /*
   * Sanity checks on the user-supplied configuration
-@@ -168,7 +169,7 @@ int32 OS_CountSemTake(osal_id_t sem_id)
-     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_NONE, LOCAL_OBJID_TYPE, sem_id, &token);
-     if (return_code == OS_SUCCESS)
-     {
--        return_code = OS_CountSemTake_Impl(&token);
-+        OS_COOP_BLOCKING(return_code = OS_CountSemTake_Impl(&token));
-     }
- 
-     return return_code;
-@@ -189,7 +190,7 @@ int32 OS_CountSemTimedWait(osal_id_t sem_id, uint32 msecs)
-     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_NONE, LOCAL_OBJID_TYPE, sem_id, &token);
-     if (return_code == OS_SUCCESS)
-     {
--        return_code = OS_CountSemTimedWait_Impl(&token, msecs);
-+        OS_COOP_BLOCKING(return_code = OS_CountSemTimedWait_Impl(&token, msecs));
-     }
- 
-     return return_code;
 diff --git a/src/os/shared/src/osapi-queue.c b/src/os/shared/src/osapi-queue.c
-index 2e5fe814..236f44ab 100644
+index 2e5fe814..41111eea 100644
 --- a/src/os/shared/src/osapi-queue.c
 +++ b/src/os/shared/src/osapi-queue.c
 @@ -42,6 +42,7 @@
@@ -632,26 +1130,8 @@ index 2e5fe814..236f44ab 100644
  
  /*
   * Sanity checks on the user-supplied configuration
-@@ -174,7 +175,7 @@ int32 OS_QueueGet(osal_id_t queue_id, void *data, size_t size, size_t *size_copi
-         }
-         else
-         {
--            return_code = OS_QueueGet_Impl(&token, data, size, size_copied, timeout);
-+            OS_COOP_BLOCKING(return_code = OS_QueueGet_Impl(&token, data, size, size_copied, timeout));
-         }
-     }
- 
-@@ -211,7 +212,7 @@ int32 OS_QueuePut(osal_id_t queue_id, const void *data, size_t size, uint32 flag
-         }
-         else
-         {
--            return_code = OS_QueuePut_Impl(&token, data, size, flags);
-+            OS_COOP_BLOCKING(return_code = OS_QueuePut_Impl(&token, data, size, flags));
-         }
-     }
- 
 diff --git a/src/os/shared/src/osapi-select.c b/src/os/shared/src/osapi-select.c
-index 25f7d949..57a618e4 100644
+index 25f7d949..ea8665a6 100644
 --- a/src/os/shared/src/osapi-select.c
 +++ b/src/os/shared/src/osapi-select.c
 @@ -41,6 +41,7 @@
@@ -667,7 +1147,7 @@ index 25f7d949..57a618e4 100644
      if (return_code == OS_SUCCESS)
      {
 -        return_code = OS_SelectSingle_Impl(&token, StateFlags, abs_timeout);
-+        OS_COOP_BLOCKING(return_code = OS_SelectSingle_Impl(&token, StateFlags, abs_timeout));
++        OS_COOP_EXTERNAL(return_code = OS_SelectSingle_Impl(&token, StateFlags, abs_timeout));
  
          OS_ObjectIdRelease(&token);
      }
@@ -676,12 +1156,12 @@ index 25f7d949..57a618e4 100644
       * OS_SelectMultiple() call in another thread.
       */
 -    return_code = OS_SelectMultiple_Impl(ReadSet, WriteSet, abs_timeout);
-+    OS_COOP_BLOCKING(return_code = OS_SelectMultiple_Impl(ReadSet, WriteSet, abs_timeout));
++    OS_COOP_EXTERNAL(return_code = OS_SelectMultiple_Impl(ReadSet, WriteSet, abs_timeout));
  
      return return_code;
  }
 diff --git a/src/os/shared/src/osapi-sockets.c b/src/os/shared/src/osapi-sockets.c
-index 1f58ed5a..4c43e2b7 100644
+index 1f58ed5a..10603e0f 100644
 --- a/src/os/shared/src/osapi-sockets.c
 +++ b/src/os/shared/src/osapi-sockets.c
 @@ -41,6 +41,7 @@
@@ -697,7 +1177,7 @@ index 1f58ed5a..4c43e2b7 100644
                  OS_SocketAddrInit_Impl(Addr, sock->socket_domain);
  
 -                return_code = OS_SocketAccept_Impl(&sock_token, &conn_token, Addr, abs_timeout);
-+                OS_COOP_BLOCKING(return_code = OS_SocketAccept_Impl(&sock_token, &conn_token, Addr, abs_timeout));
++                OS_COOP_EXTERNAL(return_code = OS_SocketAccept_Impl(&sock_token, &conn_token, Addr, abs_timeout));
  
                  if (return_code == OS_SUCCESS)
                  {
@@ -706,7 +1186,7 @@ index 1f58ed5a..4c43e2b7 100644
          else
          {
 -            return_code = OS_SocketConnect_Impl(&token, Addr, abs_timeout);
-+            OS_COOP_BLOCKING(return_code = OS_SocketConnect_Impl(&token, Addr, abs_timeout));
++            OS_COOP_EXTERNAL(return_code = OS_SocketConnect_Impl(&token, Addr, abs_timeout));
  
              if (return_code == OS_SUCCESS)
              {
@@ -715,12 +1195,12 @@ index 1f58ed5a..4c43e2b7 100644
          else
          {
 -            return_code = OS_SocketRecvFrom_Impl(&token, buffer, buflen, RemoteAddr, abs_timeout);
-+            OS_COOP_BLOCKING(return_code = OS_SocketRecvFrom_Impl(&token, buffer, buflen, RemoteAddr, abs_timeout));
++            OS_COOP_EXTERNAL(return_code = OS_SocketRecvFrom_Impl(&token, buffer, buflen, RemoteAddr, abs_timeout));
          }
  
          OS_ObjectIdRelease(&token);
 diff --git a/src/os/shared/src/osapi-task.c b/src/os/shared/src/osapi-task.c
-index 20e697d2..85058975 100644
+index 20e697d2..97c23efc 100644
 --- a/src/os/shared/src/osapi-task.c
 +++ b/src/os/shared/src/osapi-task.c
 @@ -44,6 +44,7 @@
@@ -766,14 +1246,14 @@ index 20e697d2..85058975 100644
 -    return OS_TaskDelay_Impl(millisecond);
 +    int32 return_code;
 +
-+    OS_COOP_BLOCKING(return_code = OS_TaskDelay_Impl(millisecond));
++    return_code = OS_TaskDelay_Impl(millisecond);
 +
 +    return return_code;
  }
  
  /*----------------------------------------------------------------
 diff --git a/src/os/shared/src/osapi-timebase.c b/src/os/shared/src/osapi-timebase.c
-index e5db0ebb..bb54950c 100644
+index e5db0ebb..ce12fa17 100644
 --- a/src/os/shared/src/osapi-timebase.c
 +++ b/src/os/shared/src/osapi-timebase.c
 @@ -84,6 +84,26 @@ int32 OS_TimeBaseAPI_Init(void)
@@ -821,7 +1301,7 @@ index e5db0ebb..bb54950c 100644
  
      /*
       * Register this task as a time base handler.
-@@ -392,18 +414,36 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
+@@ -392,18 +414,39 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
      record   = OS_OBJECT_TABLE_GET(OS_global_timebase_table, token);
      timebase = OS_OBJECT_TABLE_GET(OS_timebase_table, token);
  
@@ -857,11 +1337,14 @@ index e5db0ebb..bb54950c 100644
 +        /* Pending on the harness must not hold the token: every task would
 +         * stall until the next tick was granted, which is a deadlock in all but
 +         * name. */
-+        OS_COOP_BLOCKING(tick_time = (*syncfunc)(timebase_id));
++        /* The harness lives outside the simulation, so leave the ready set while
++         * pending on it -- otherwise the scheduler would keep choosing us and
++         * stall waiting for a task that cannot proceed. */
++        OS_COOP_EXTERNAL(tick_time = (*syncfunc)(timebase_id));
  
          /*
           * The returned tick_time should be nonzero.  If the sync function
-@@ -458,6 +498,18 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
+@@ -458,6 +501,23 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
          }
  
          timebase->freerun_time += tick_time;
@@ -875,6 +1358,11 @@ index e5db0ebb..bb54950c 100644
 +        if (syncfunc != NULL && is_external_sync)
 +        {
 +            OS_SimTime_Advance_Impl(tick_time);
++
++            /* Expire any task sleeping on simulated time. Done here, holding the
++             * token, so a delay ends at a defined point in the schedule rather
++             * than whenever the host clock happens to fire. */
++            OS_Coop_WakeDelays_Impl(OS_SimTime_GetUsec_Impl());
 +        }
 +
          if (OS_ObjectIdGetById(OS_LOCK_MODE_NONE, OS_OBJECT_TYPE_OS_TIMECB, timebase->first_cb, &cb_token) == 0)
