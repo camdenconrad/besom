@@ -81,10 +81,12 @@ recording a guard band before you stop granting time. Both ends pinned to the sa
 Set `BESOM_COOP=0` to fall back to host scheduling: faster, but then only the *stream* is guaranteed,
 not tick placement.
 
-Within a single granted tick, cFE's tasks are *simultaneous* in simulated time — and the **host**
-scheduler decides which of them actually runs first. So *what* the flight software does is
-deterministic; *when* it does it is not, for a minority of packets. Closing that gap needs a
-cooperative scheduler inside OSAL, not a better clock.
+Within a single granted tick, cFE's tasks are *simultaneous* in simulated time. Left to the host
+scheduler, *which* of them runs first is Linux's choice, and placement jitters for a minority of
+packets: *what* the flight software does would be deterministic, *when* it does it would not. Closing
+that gap needed a cooperative scheduler inside OSAL, not a better clock — which is what `BESOM_COOP`
+now is, and why placement is reproducible above rather than merely tolerated. How it was actually
+solved, and the two obvious ideas that do not work, are below.
 
 The run's *edge* is handled at source rather than tolerated: the harness stops **recording** a guard
 band of ticks before it stops **granting time**. Otherwise a packet emitted on the final tick may or
@@ -92,10 +94,11 @@ may not have reached the socket, and a periodic app whose timer was armed during
 N or N+1 times over a fixed budget — the transcript's last packet then appears and disappears between
 runs, which is the run's edge moving, not the software behaving differently.
 
-**So assert on the stream, never on tick placement.** That catches every real defect — a dropped
-packet, a duplicate, a wrong size, a reordering, a wrong value — without asserting on Linux's
-scheduler. `Transcript::same_stream` does exactly this; `besomctl check` fails on a stream difference
-and merely *reports* placement jitter.
+**Under `BESOM_COOP=0`, assert on the stream and never on tick placement.** Host scheduling gives you
+the stream guarantee only, and a placement assertion there is an assertion about Linux's scheduler.
+`Transcript::same_stream` is that weaker check: it still catches every real defect — a dropped packet,
+a duplicate, a wrong size, a reordering, a wrong value. With coop scheduling on (the default),
+`besomctl check` holds both, and fails on a difference in either.
 
 ## Closing the loop
 
@@ -218,18 +221,18 @@ scene is a sphere, a trail and a few axes, and a second renderer would be cost w
 
 ## Status
 
-Usable. The stream guarantee holds run after run, the closed loop verifies, and you can write a cFS
-app and regression-test it today.
+Usable. cFS is byte-deterministic under the harness — same packets, same ticks, run after run — the
+closed loop verifies, and you can write a cFS app and regression-test it today.
+
+Deterministic tick **placement** was the last gap and is now closed by the cooperative scheduler; it
+is what `BESOM_COOP` buys you. Two approaches were tried before it and neither works — they are
+written up below, so nobody repeats them.
 
 Known gaps, in the order they matter:
 
-1. **Deterministic tick PLACEMENT.** The stream is reproducible; *which tick* a packet lands on is
-   not, for a minority of packets. This does not affect regression testing (assert the stream), but
-   it is what stands between this and a byte-deterministic cFS. Two approaches have been tried and
-   neither works; see below. Don't repeat them.
-2. **More device simulation.** `besom_io` proves the path; real sensors (star tracker, IMU, GPS)
+1. **More device simulation.** `besom_io` proves the path; real sensors (star tracker, IMU, GPS)
    belong behind the OSAL/PSP `iodriver` seam so flight apps talk to them over the buses they would
    really use.
-3. **J2 and a real attitude model.**
+2. **J2 and a real attitude model.**
 
 Licensed Apache-2.0, matching cFS.
