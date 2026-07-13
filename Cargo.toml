@@ -1,0 +1,37 @@
+[package]
+name = "besom"
+version = "0.1.0"
+edition = "2021"
+authors = ["Camden Conrad <camdenconrad1@gmail.com>"]
+license = "Apache-2.0"
+description = "A deterministic simulation harness and ground station for NASA's core Flight System (cFS)."
+repository = "https://github.com/camdenconrad/besom"
+readme = "README.md"
+keywords = ["cfs", "nasa", "spacecraft", "simulation", "flight-software"]
+categories = ["aerospace", "simulation"]
+
+[lib]
+path = "src/lib.rs"
+
+# The GUI is feature-gated so the headless harness builds without a display --
+# CI runs determinism checks with --no-default-features.
+[features]
+default = ["app"]
+app = ["dep:eframe", "dep:egui"]
+
+# The ground station.
+[[bin]]
+name = "besom"
+path = "src/main_gui.rs"
+required-features = ["app"]
+
+# The headless harness: run a scenario, check reproducibility.
+[[bin]]
+name = "besomctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+eframe = { version = "0.29.1", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"], optional = true }
+egui = { version = "0.29.1", optional = true }

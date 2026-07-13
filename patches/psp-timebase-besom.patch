@@ -1,0 +1,297 @@
+diff --git a/fsw/modules/timebase_besom/CMakeLists.txt b/fsw/modules/timebase_besom/CMakeLists.txt
+new file mode 100644
+index 0000000..81d4370
+--- /dev/null
++++ b/fsw/modules/timebase_besom/CMakeLists.txt
+@@ -0,0 +1 @@
++add_psp_module(timebase_besom cfe_psp_timebase_besom.c)
+diff --git a/fsw/modules/timebase_besom/cfe_psp_timebase_besom.c b/fsw/modules/timebase_besom/cfe_psp_timebase_besom.c
+new file mode 100644
+index 0000000..8cb49cf
+--- /dev/null
++++ b/fsw/modules/timebase_besom/cfe_psp_timebase_besom.c
+@@ -0,0 +1,270 @@
++/************************************************************************
++ * Besom deterministic timebase
++ *
++ * Replaces BOTH soft_timebase (the OSAL tick source that drives cFE
++ * scheduling) and timebase_posix_clock (CFE_PSP_GetTime, which stamps
++ * telemetry).  Both must come from the same simulated clock, otherwise
++ * cFE would schedule on simulated time but timestamp on wall time.
++ *
++ * The OSAL external-sync hook is the seam: OS_TimeBaseCreate() accepts a
++ * function that blocks until the next tick and returns the elapsed time in
++ * microseconds (see osapi-timebase.c, OS_TimeBase_CallbackThread).  Here that
++ * function blocks on a UNIX datagram socket, so cFE time advances only when
++ * the Besom harness sends a step.  No cFE core changes are required.
++ *
++ * Wire protocol (v0), little-endian, over $BESOM_STEP_SOCK:
++ *   Besom -> PSP : u32  step_usec   (microseconds to advance; must be nonzero)
++ *   PSP  -> Besom: u64  sim_usec    (simulated clock AFTER applying the step)
++ *
++ * The reply is sent before cFE has finished acting on the tick, so it paces
++ * Besom but does not by itself prove quiescence.  See BESOM-PHASE0 notes.
++ *
++ * If BESOM_STEP_SOCK is unset the module free-runs on the host clock at
++ * CFE_PSP_SOFT_TIMEBASE_PERIOD, behaving like stock soft_timebase.  This keeps
++ * a Besom-enabled PSP usable for ordinary (non-simulated) runs.
++ ************************************************************************/
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <time.h>
++#include <unistd.h>
++#include <stdatomic.h>
++#include <stdbool.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++
++#include "cfe_psp.h"
++#include "cfe_psp_module.h"
++#include "cfe_psp_config.h"
++
++CFE_PSP_MODULE_DECLARE_SIMPLE(timebase_besom);
++
++/*
++ * Simulated epoch. Fixed (not wall-clock) so that two runs of the same
++ * scenario produce identical timestamps -- this is the whole point.
++ */
++#define BESOM_EPOCH_SECONDS 0
++
++static struct
++{
++    osal_id_t sys_timebase_id;
++    int       sock;                  /* bound UNIX dgram socket, -1 if free-running */
++    struct sockaddr_un peer;         /* last sender; where step replies go */
++    socklen_t          peer_len;
++    bool               have_peer;    /* a step is outstanding, ack it on re-entry */
++
++    /*
++     * Simulated microseconds since BESOM_EPOCH_SECONDS.
++     * Written by the OSAL timebase helper thread, read by any task calling
++     * CFE_PSP_GetTime(), so it must be atomic.
++     */
++    atomic_ullong sim_usec;
++} PSP_Besom_Global;
++
++/*
++ * Free-running fallback: sleep one nominal period and report it.
++ */
++static uint32 PSP_Besom_FreeRunSync(osal_id_t timebase_id)
++{
++    struct timespec period;
++
++    period.tv_sec  = CFE_PSP_SOFT_TIMEBASE_PERIOD / 1000000;
++    period.tv_nsec = (CFE_PSP_SOFT_TIMEBASE_PERIOD % 1000000) * 1000;
++
++    while (nanosleep(&period, &period) != 0 && errno == EINTR)
++    {
++        /* interrupted - finish the remaining time */
++    }
++
++    atomic_fetch_add(&PSP_Besom_Global.sim_usec, CFE_PSP_SOFT_TIMEBASE_PERIOD);
++    return CFE_PSP_SOFT_TIMEBASE_PERIOD;
++}
++
++/*
++ * Deterministic sync: block until Besom sends a step.
++ *
++ * Returning 0 tells OSAL "elapsed time unknown" and it will re-invoke us (with
++ * a spin limit), which is the correct response to an interrupted or malformed
++ * read -- we must not invent time that the harness did not grant.
++ */
++static uint32 PSP_Besom_StepSync(osal_id_t timebase_id)
++{
++    uint32             step_usec;
++    ssize_t            n;
++    unsigned long long now_usec;
++
++    /*
++     * Acknowledge the PREVIOUS step here, at function entry, rather than right
++     * after consuming it.
++     *
++     * OSAL's timebase helper thread only calls this function again once it has
++     * finished walking the callback list for the previous tick (see
++     * OS_TimeBase_CallbackThread). So re-entry is a hard guarantee that the
++     * previous tick was fully dispatched -- every timer callback for it has run.
++     * Acking on consumption instead (the obvious placement) tells the harness
++     * "done" before any of that work happens, which makes the run unreproducible
++     * by construction.
++     *
++     * This does not prove the *tasks* woken by those callbacks have finished --
++     * they run on their own threads. The harness still has to wait for those.
++     * But it removes the timebase thread from the race entirely.
++     */
++    if (PSP_Besom_Global.have_peer)
++    {
++        now_usec = atomic_load(&PSP_Besom_Global.sim_usec);
++        sendto(PSP_Besom_Global.sock, &now_usec, sizeof(now_usec), 0,
++               (struct sockaddr *)&PSP_Besom_Global.peer, PSP_Besom_Global.peer_len);
++        PSP_Besom_Global.have_peer = false;
++    }
++
++    PSP_Besom_Global.peer_len = sizeof(PSP_Besom_Global.peer);
++
++    n = recvfrom(PSP_Besom_Global.sock, &step_usec, sizeof(step_usec), 0,
++                 (struct sockaddr *)&PSP_Besom_Global.peer, &PSP_Besom_Global.peer_len);
++
++    if (n != (ssize_t)sizeof(step_usec) || step_usec == 0)
++    {
++        /* EINTR, short read, or a zero step: no time has passed. */
++        return 0;
++    }
++
++    atomic_fetch_add(&PSP_Besom_Global.sim_usec, step_usec);
++
++    if (PSP_Besom_Global.peer_len > 0 && PSP_Besom_Global.peer.sun_family == AF_UNIX)
++    {
++        PSP_Besom_Global.have_peer = true;
++    }
++
++    return step_usec;
++}
++
++/*
++ * Bind the step socket.  Returns -1 (and leaves the module free-running) if
++ * BESOM_STEP_SOCK is unset or the socket cannot be bound.
++ */
++static int PSP_Besom_OpenStepSocket(void)
++{
++    const char        *path;
++    struct sockaddr_un addr;
++    int                sock;
++
++    path = getenv("BESOM_STEP_SOCK");
++    if (path == NULL || path[0] == '\0')
++    {
++        return -1;
++    }
++
++    if (strlen(path) >= sizeof(addr.sun_path))
++    {
++        printf("CFE_PSP(besom): BESOM_STEP_SOCK path too long, free-running\n");
++        return -1;
++    }
++
++    sock = socket(AF_UNIX, SOCK_DGRAM, 0);
++    if (sock < 0)
++    {
++        printf("CFE_PSP(besom): socket() failed (%s), free-running\n", strerror(errno));
++        return -1;
++    }
++
++    /* A stale socket file from a previous run would make bind() fail with EADDRINUSE. */
++    unlink(path);
++
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
++
++    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0)
++    {
++        printf("CFE_PSP(besom): bind(%s) failed (%s), free-running\n", path, strerror(errno));
++        close(sock);
++        return -1;
++    }
++
++    return sock;
++}
++
++void timebase_besom_Init(uint32 PspModuleId)
++{
++    int32          status;
++    OS_TimerSync_t syncfunc;
++
++    memset(&PSP_Besom_Global, 0, sizeof(PSP_Besom_Global));
++    atomic_init(&PSP_Besom_Global.sim_usec, 0);
++
++    PSP_Besom_Global.sock = PSP_Besom_OpenStepSocket();
++
++    if (PSP_Besom_Global.sock >= 0)
++    {
++        syncfunc = PSP_Besom_StepSync;
++        printf("CFE_PSP(besom): DETERMINISTIC timebase - stepping from %s\n", getenv("BESOM_STEP_SOCK"));
++    }
++    else
++    {
++        syncfunc = PSP_Besom_FreeRunSync;
++        printf("CFE_PSP(besom): free-running timebase at %lu usec (BESOM_STEP_SOCK unset)\n",
++               (unsigned long)CFE_PSP_SOFT_TIMEBASE_PERIOD);
++    }
++
++    status = OS_TimeBaseCreate(&PSP_Besom_Global.sys_timebase_id, CFE_PSP_SOFT_TIMEBASE_NAME, syncfunc);
++    if (status == OS_SUCCESS)
++    {
++        status = OS_TimeBaseSet(PSP_Besom_Global.sys_timebase_id, CFE_PSP_SOFT_TIMEBASE_PERIOD,
++                                CFE_PSP_SOFT_TIMEBASE_PERIOD);
++    }
++
++    if (status != OS_SUCCESS)
++    {
++        printf("CFE_PSP(besom): *** failed to configure timebase '%s', status = %d ***\n",
++               CFE_PSP_SOFT_TIMEBASE_NAME, (int)status);
++    }
++}
++
++/*
++ * ---- Clock API (replaces timebase_posix_clock) ----
++ * Every timestamp cFE produces comes from here, so it must read the simulated
++ * clock, not the host clock.
++ */
++
++void CFE_PSP_GetTime(OS_time_t *LocalTime)
++{
++    unsigned long long usec;
++
++    if (LocalTime == NULL)
++    {
++        return;
++    }
++
++    usec = atomic_load(&PSP_Besom_Global.sim_usec);
++
++    *LocalTime = OS_TimeAssembleFromMicroseconds((int64)(BESOM_EPOCH_SECONDS + (usec / 1000000)),
++                                                 (uint32)(usec % 1000000));
++}
++
++void CFE_PSP_Get_Timebase(uint32 *Tbu, uint32 *Tbl)
++{
++    unsigned long long usec = atomic_load(&PSP_Besom_Global.sim_usec);
++
++    if (Tbu != NULL)
++    {
++        *Tbu = (uint32)(usec >> 32);
++    }
++    if (Tbl != NULL)
++    {
++        *Tbl = (uint32)(usec & 0xFFFFFFFFU);
++    }
++}
++
++uint32 CFE_PSP_GetTimerTicksPerSecond(void)
++{
++    /* The Besom timebase is denominated in microseconds. */
++    return 1000000;
++}
++
++uint32 CFE_PSP_GetTimerLow32Rollover(void)
++{
++    /* Low 32 bits of a microsecond counter roll over at 2^32. */
++    return 0;
++}
+diff --git a/fsw/pc-linux/psp_module_list.cmake b/fsw/pc-linux/psp_module_list.cmake
+index c574398..cda0045 100644
+--- a/fsw/pc-linux/psp_module_list.cmake
++++ b/fsw/pc-linux/psp_module_list.cmake
+@@ -1,8 +1,7 @@
+ # This is a list of modules that is included as a fixed/base set
+ # when this PSP is selected.  They must exist under fsw/modules
+ 
+-soft_timebase
+-timebase_posix_clock
++timebase_besom
+ eeprom_mmap_file
+ port_notimpl
+ iodriver

@@ -1,0 +1,457 @@
+diff --git a/src/os/posix/src/os-impl-binsem.c b/src/os/posix/src/os-impl-binsem.c
+index 996f61c2..93aaa0d4 100644
+--- a/src/os/posix/src/os-impl-binsem.c
++++ b/src/os/posix/src/os-impl-binsem.c
+@@ -31,6 +31,7 @@
+ 
+ #include "os-posix.h"
+ #include "os-shared-idmap.h"
++#include "os-shared-timebase.h" /* simulated-time hooks */
+ #include "os-shared-binsem.h"
+ #include "os-impl-binsem.h"
+ 
+@@ -458,6 +459,37 @@ int32 OS_BinSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
+ {
+     struct timespec ts;
+ 
++    /*
++     * Simulated time owns the clock: bound this wait by simulated microseconds
++     * rather than the host clock. A zeroed (already-expired) timespec makes
++     * OS_GenericBinSemTake_Impl a non-blocking check -- it only pends when
++     * current_value is zero -- so poll it, then wait for the next granted tick,
++     * until the simulated deadline passes.
++     */
++    if (OS_SimTime_Active_Impl())
++    {
++        unsigned long long deadline = OS_SimTime_GetUsec_Impl() + (unsigned long long)msecs * 1000;
++        int32              status;
++
++        for (;;)
++        {
++            memset(&ts, 0, sizeof(ts));
++
++            status = OS_GenericBinSemTake_Impl(token, &ts);
++            if (status != OS_SEM_TIMEOUT)
++            {
++                return status; /* acquired, or a real failure */
++            }
++
++            if (OS_SimTime_GetUsec_Impl() >= deadline)
++            {
++                return OS_SEM_TIMEOUT;
++            }
++
++            OS_SimTime_WaitTick_Impl(deadline);
++        }
++    }
++
+     /*
+      ** Compute an absolute time for the delay
+      */
+diff --git a/src/os/posix/src/os-impl-countsem.c b/src/os/posix/src/os-impl-countsem.c
+index dfa8770e..020d850a 100644
+--- a/src/os/posix/src/os-impl-countsem.c
++++ b/src/os/posix/src/os-impl-countsem.c
+@@ -31,6 +31,7 @@
+ #include "os-impl-countsem.h"
+ #include "os-shared-countsem.h"
+ #include "os-shared-idmap.h"
++#include "os-shared-timebase.h" /* simulated-time hooks */
+ 
+ /*
+  * Added SEM_VALUE_MAX Define
+@@ -164,6 +165,38 @@ int32 OS_CountSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
+ 
+     impl = OS_OBJECT_TABLE_GET(OS_impl_count_sem_table, *token);
+ 
++    /*
++     * Simulated time owns the clock: measure the timeout in simulated
++     * microseconds rather than pending on the host clock, which would let this
++     * task wake on wall time and escape the simulation. Try the semaphore
++     * without blocking, then wait for the next granted tick and retry, until
++     * the simulated deadline passes.
++     */
++    if (OS_SimTime_Active_Impl())
++    {
++        unsigned long long deadline = OS_SimTime_GetUsec_Impl() + (unsigned long long)msecs * 1000;
++
++        for (;;)
++        {
++            if (sem_trywait(&impl->id) == 0)
++            {
++                return OS_SUCCESS;
++            }
++
++            if (errno != EAGAIN && errno != EINTR)
++            {
++                return OS_SEM_FAILURE;
++            }
++
++            if (OS_SimTime_GetUsec_Impl() >= deadline)
++            {
++                return OS_SEM_TIMEOUT;
++            }
++
++            OS_SimTime_WaitTick_Impl(deadline);
++        }
++    }
++
+     /*
+      ** Compute an absolute time for the delay
+      */
+diff --git a/src/os/posix/src/os-impl-queues.c b/src/os/posix/src/os-impl-queues.c
+index 562abebb..49c8728a 100644
+--- a/src/os/posix/src/os-impl-queues.c
++++ b/src/os/posix/src/os-impl-queues.c
+@@ -33,6 +33,7 @@
+ #include "os-impl-queues.h"
+ #include "os-shared-queue.h"
+ #include "os-shared-idmap.h"
++#include "os-shared-timebase.h" /* simulated-time hooks: timed waits must use sim time */
+ 
+ /* Tables where the OS object information is stored */
+ OS_impl_queue_internal_record_t OS_impl_queue_table[OS_MAX_QUEUES];
+@@ -222,21 +223,67 @@ int32 OS_QueueGet_Impl(const OS_object_token_t *token, void *data, size_t size,
+          */
+         if (timeout == OS_CHECK)
+         {
++            /*
++             * Non-blocking poll: an absolute timeout of zero is already in the
++             * past, so mq_timedreceive returns immediately -- with the message
++             * if one is queued, ETIMEDOUT if not.
++             */
+             memset(&ts, 0, sizeof(ts));
++
++            sizeCopied = mq_timedreceive(impl->id, data, size, NULL, &ts);
++        }
++        else if (OS_SimTime_Active_Impl())
++        {
++            /*
++             * Simulated time owns the clock, so this timeout must be measured in
++             * simulated microseconds. Waiting on the host clock here (what
++             * mq_timedreceive would do) lets the task wake on wall time and
++             * escape the simulation entirely -- cFS's HS app pends on a timed
++             * receive and did exactly that.
++             *
++             * Poll without blocking, then wait for the next granted tick and
++             * poll again, until the simulated deadline passes. The harness gates
++             * ticks on quiescence, so a task parked here is blocked and cannot
++             * progress until time is granted -- which is what makes the run
++             * reproducible.
++             */
++            unsigned long long deadline = OS_SimTime_GetUsec_Impl() + (unsigned long long)timeout * 1000;
++
++            memset(&ts, 0, sizeof(ts));
++
++            for (;;)
++            {
++                do
++                {
++                    sizeCopied = mq_timedreceive(impl->id, data, size, NULL, &ts);
++                } while (sizeCopied < 0 && errno == EINTR);
++
++                if (sizeCopied >= 0 || errno != ETIMEDOUT)
++                {
++                    break; /* got a message, or a real error */
++                }
++
++                if (OS_SimTime_GetUsec_Impl() >= deadline)
++                {
++                    break; /* simulated timeout expired; errno stays ETIMEDOUT */
++                }
++
++                OS_SimTime_WaitTick_Impl(deadline);
++            }
+         }
+         else
+         {
+             OS_Posix_CompAbsDelayTime(timeout, &ts);
+-        }
+ 
+-        /*
+-         ** If the mq_timedreceive call is interrupted by a system call or signal,
+-         ** call it again.
+-         */
+-        do
+-        {
+-            sizeCopied = mq_timedreceive(impl->id, data, size, NULL, &ts);
+-        } while (timeout != OS_CHECK && sizeCopied < 0 && errno == EINTR);
++            /*
++             ** If the mq_timedreceive call is interrupted by a system call or signal,
++             ** call it again.
++             */
++            do
++            {
++                sizeCopied = mq_timedreceive(impl->id, data, size, NULL, &ts);
++            } while (sizeCopied < 0 && errno == EINTR);
++        }
+ 
+     } /* END timeout */
+ 
+diff --git a/src/os/posix/src/os-impl-tasks.c b/src/os/posix/src/os-impl-tasks.c
+index a7d9cb46..419d100d 100644
+--- a/src/os/posix/src/os-impl-tasks.c
++++ b/src/os/posix/src/os-impl-tasks.c
+@@ -748,11 +748,133 @@ void OS_TaskExit_Impl(void)
+  *           See prototype for argument/return detail
+  *
+  *-----------------------------------------------------------------*/
++/*
++ * ---- Simulated-time task delay (Besom) ----
++ *
++ * OS_TaskDelay is otherwise a real clock_nanosleep on the HOST clock, which
++ * means any task that sleeps runs OUTSIDE a simulated timebase entirely. With
++ * an externally-synced timebase (see OS_TimeBaseCreate's external_sync), the
++ * scheduler's ticks are under the simulation's control but sleeping tasks are
++ * not -- so their work lands at host-scheduling-dependent moments and telemetry
++ * is not reproducible. cFS apps that sleep (cf, hs, mm, cs, fm) exhibit exactly
++ * this.
++ *
++ * Fix: OSAL maintains its own simulated microsecond counter, advanced by the
++ * timebase helper thread on every externally-synced tick, and OS_TaskDelay
++ * pends on it rather than on the host clock.
++ *
++ * This lives in the POSIX layer because the shared layer is OS-agnostic and may
++ * not use pthreads. OSAL cannot read the PSP's clock (the PSP sits *above*
++ * OSAL), so OSAL must track simulated time itself -- the tick is the only
++ * information that crosses the boundary, and it is enough.
++ */
++static struct
++{
++    pthread_mutex_t    mutex;
++    pthread_cond_t     cond;
++    unsigned long long usec;
++    bool               active; /* set once an external-sync tick has arrived */
++} OS_SimTime = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, false};
++
++/*
++ * The timebase helper thread is the only advancer of simulated time. If it ever
++ * pended on the sim clock it would deadlock waiting for itself, so it is marked
++ * and always takes the real-sleep path.
++ */
++static __thread bool OS_SimTime_IsTickThread = false;
++
++void OS_SimTime_MarkTickThread_Impl(void)
++{
++    OS_SimTime_IsTickThread = true;
++}
++
++void OS_SimTime_Advance_Impl(uint32 usec)
++{
++    pthread_mutex_lock(&OS_SimTime.mutex);
++    OS_SimTime.usec += usec;
++    OS_SimTime.active = true;
++    pthread_cond_broadcast(&OS_SimTime.cond);
++    pthread_mutex_unlock(&OS_SimTime.mutex);
++}
++
++/*
++ * True when the simulation owns the clock and the caller is a task that may
++ * legitimately pend on it (i.e. not the tick thread, which advances it).
++ */
++bool OS_SimTime_Active_Impl(void)
++{
++    bool active;
++
++    if (OS_SimTime_IsTickThread)
++    {
++        return false;
++    }
++
++    pthread_mutex_lock(&OS_SimTime.mutex);
++    active = OS_SimTime.active;
++    pthread_mutex_unlock(&OS_SimTime.mutex);
++
++    return active;
++}
++
++unsigned long long OS_SimTime_GetUsec_Impl(void)
++{
++    unsigned long long usec;
++
++    pthread_mutex_lock(&OS_SimTime.mutex);
++    usec = OS_SimTime.usec;
++    pthread_mutex_unlock(&OS_SimTime.mutex);
++
++    return usec;
++}
++
++/*
++ * Block until simulated time advances past `until_usec`, or until it advances at
++ * all (whichever comes first). Callers that are waiting on some *other* event
++ * with a timeout use this to re-poll that event once per granted tick, so their
++ * timeout is measured in simulated time rather than host time.
++ */
++void OS_SimTime_WaitTick_Impl(unsigned long long until_usec)
++{
++    unsigned long long start;
++
++    pthread_mutex_lock(&OS_SimTime.mutex);
++    start = OS_SimTime.usec;
++    while (OS_SimTime.usec == start && OS_SimTime.usec < until_usec)
++    {
++        pthread_cond_wait(&OS_SimTime.cond, &OS_SimTime.mutex);
++    }
++    pthread_mutex_unlock(&OS_SimTime.mutex);
++}
++
+ int32 OS_TaskDelay_Impl(uint32 millisecond)
+ {
+     struct timespec sleep_end;
+     int             status;
+ 
++    /*
++     * Simulated path: pend until the simulation has granted enough time.
++     *
++     * Not used before the first tick (nothing is driving the clock yet, so a
++     * task would hang forever) and never used on the tick thread itself.
++     */
++    if (!OS_SimTime_IsTickThread)
++    {
++        pthread_mutex_lock(&OS_SimTime.mutex);
++        if (OS_SimTime.active)
++        {
++            unsigned long long deadline = OS_SimTime.usec + (unsigned long long)millisecond * 1000;
++
++            while (OS_SimTime.usec < deadline)
++            {
++                pthread_cond_wait(&OS_SimTime.cond, &OS_SimTime.mutex);
++            }
++            pthread_mutex_unlock(&OS_SimTime.mutex);
++            return OS_SUCCESS;
++        }
++        pthread_mutex_unlock(&OS_SimTime.mutex);
++    }
++
+     clock_gettime(CLOCK_MONOTONIC, &sleep_end);
+     sleep_end.tv_sec  += millisecond / 1000;
+     sleep_end.tv_nsec += 1000000 * (millisecond % 1000);
+diff --git a/src/os/shared/inc/os-shared-timebase.h b/src/os/shared/inc/os-shared-timebase.h
+index 5ee19111..151d62bc 100644
+--- a/src/os/shared/inc/os-shared-timebase.h
++++ b/src/os/shared/inc/os-shared-timebase.h
+@@ -33,6 +33,7 @@ typedef struct
+ {
+     char           timebase_name[OS_MAX_API_NAME];
+     OS_TimerSync_t external_sync;
++    bool           is_external_sync; /* caller supplied the sync fn (simulation drives the clock) */
+     uint32         accuracy_usec;
+     osal_id_t      first_cb;
+     uint32         freerun_time;
+@@ -40,6 +41,27 @@ typedef struct
+     uint32         nominal_interval_time;
+ } OS_timebase_internal_record_t;
+ 
++/*
++ * Simulated-time hooks (implemented in the OS layer; see os-impl-tasks.c).
++ *
++ * When a timebase is driven by a caller-supplied sync function, the simulation
++ * owns the clock. OS_TaskDelay must then pend on simulated time rather than the
++ * host clock, or every sleeping task escapes the simulation.
++ */
++void OS_SimTime_Advance_Impl(uint32 usec);
++void OS_SimTime_MarkTickThread_Impl(void);
++
++/*
++ * Every OSAL primitive that blocks WITH A TIMEOUT must measure that timeout in
++ * simulated time, not host time -- otherwise a task waiting on a timed receive
++ * (cFS's HS app does exactly this) wakes on the host clock and escapes the
++ * simulation just as surely as a sleeping one does. Such callers re-poll their
++ * event once per granted tick via OS_SimTime_WaitTick_Impl.
++ */
++bool               OS_SimTime_Active_Impl(void);
++unsigned long long OS_SimTime_GetUsec_Impl(void);
++void               OS_SimTime_WaitTick_Impl(unsigned long long until_usec);
++
+ /*
+  * These record types have extra information with each entry.  These tables are used
+  * to share extra data between the common layer and the OS-specific implementation.
+diff --git a/src/os/shared/src/osapi-timebase.c b/src/os/shared/src/osapi-timebase.c
+index e5db0ebb..d3cd158b 100644
+--- a/src/os/shared/src/osapi-timebase.c
++++ b/src/os/shared/src/osapi-timebase.c
+@@ -84,6 +84,25 @@ int32 OS_TimeBaseAPI_Init(void)
+     return OS_SUCCESS;
+ }
+ 
++/*
++ * Weak no-op defaults for the simulated-time hooks.
++ *
++ * The real implementations live in the OS layer (os-impl-tasks.c) and override
++ * these. They exist so that builds which link the shared layer against stubbed
++ * OS implementations -- notably OSAL's own coverage tests -- still resolve.
++ */
++__attribute__((weak)) void OS_SimTime_Advance_Impl(uint32 usec) {}
++__attribute__((weak)) void OS_SimTime_MarkTickThread_Impl(void) {}
++__attribute__((weak)) bool OS_SimTime_Active_Impl(void)
++{
++    return false;
++}
++__attribute__((weak)) unsigned long long OS_SimTime_GetUsec_Impl(void)
++{
++    return 0;
++}
++__attribute__((weak)) void OS_SimTime_WaitTick_Impl(unsigned long long until_usec) {}
++
+ /*----------------------------------------------------------------
+  *
+  *  Purpose: Implemented per public OSAL API
+@@ -127,7 +146,8 @@ int32 OS_TimeBaseCreate(osal_id_t *timebase_id, const char *timebase_name, OS_Ti
+         /* Reset the table entry and save the name */
+         OS_OBJECT_INIT(token, timebase, timebase_name, timebase_name);
+ 
+-        timebase->external_sync = external_sync;
++        timebase->external_sync    = external_sync;
++        timebase->is_external_sync = (external_sync != NULL);
+         if (external_sync == NULL)
+         {
+             timebase->accuracy_usec = OS_SharedGlobalVars.MicroSecPerTick;
+@@ -373,6 +393,7 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
+     uint32                         tick_time;
+     uint32                         spin_cycles;
+     int32                          saved_wait_time;
++    bool                           is_external_sync;
+ 
+     /*
+      * Register this task as a time base handler.
+@@ -392,11 +413,19 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
+     record   = OS_OBJECT_TABLE_GET(OS_global_timebase_table, token);
+     timebase = OS_OBJECT_TABLE_GET(OS_timebase_table, token);
+ 
+-    syncfunc    = timebase->external_sync;
+-    spin_cycles = 0;
++    syncfunc         = timebase->external_sync;
++    is_external_sync = timebase->is_external_sync;
++    spin_cycles      = 0;
+ 
+     OS_ObjectIdRelease(&token);
+ 
++    /*
++     * This thread is the sole advancer of simulated time. Mark it so that if it
++     * ever calls OS_TaskDelay (it does, on the spin-limit path) it takes the
++     * real-sleep route rather than pending on a clock only it can advance.
++     */
++    OS_SimTime_MarkTickThread_Impl();
++
+     while (1)
+     {
+         /*
+@@ -458,6 +487,18 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
+         }
+ 
+         timebase->freerun_time += tick_time;
++
++        /*
++         * Advance OSAL's simulated clock so that OS_TaskDelay pends on granted
++         * ticks instead of the host clock. Only externally-synced timebases do
++         * this: a self-timed (soft) timebase already tracks real time, and
++         * driving OS_TaskDelay from it would change nothing but add coupling.
++         */
++        if (syncfunc != NULL && is_external_sync)
++        {
++            OS_SimTime_Advance_Impl(tick_time);
++        }
++
+         if (OS_ObjectIdGetById(OS_LOCK_MODE_NONE, OS_OBJECT_TYPE_OS_TIMECB, timebase->first_cb, &cb_token) == 0)
+         {
+             do

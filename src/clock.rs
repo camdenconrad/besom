@@ -1,0 +1,92 @@
+//! The simulated clock: Besom's half of the `timebase_besom` protocol.
+//!
+//! cFS runs on a PSP timebase module whose OSAL sync function blocks on a UNIX
+//! datagram socket. cFE time advances only when we send a step, so this type is
+//! the sole source of time for the flight software.
+//!
+//! Wire protocol (v0), little-endian, over `$BESOM_STEP_SOCK`:
+//! ```text
+//!   Besom -> PSP : u32  step_usec   (microseconds to advance; must be nonzero)
+//!   PSP  -> Besom: u64  sim_usec    (simulated clock, AFTER the step is dispatched)
+//! ```
+//!
+//! The reply is sent from the *entry* of the PSP's next sync call. OSAL only
+//! re-enters that function once it has finished walking the timebase's callback
+//! list, so receiving it is a hard guarantee that the previous tick was fully
+//! dispatched. (Acking on consumption instead — the obvious placement — reports
+//! "done" before any of the tick's work has happened, which makes a run
+//! irreproducible by construction.)
+//!
+//! It does NOT prove the *tasks* woken by those callbacks have finished; they
+//! run on their own threads. That is what [`crate::quiesce`] is for.
+
+use anyhow::{Context, Result};
+use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// The tick cFS is configured for (`CFE_PSP_SOFT_TIMEBASE_PERIOD`).
+pub const TICK_USEC: u32 = 10_000;
+
+pub struct Clock {
+    sock: UnixDatagram,
+    psp_path: PathBuf,
+    our_path: PathBuf,
+    sim_usec: u64,
+}
+
+impl Clock {
+    /// Connect to a cFS instance whose PSP has bound `psp_path`.
+    ///
+    /// Our own socket must be bound: the PSP replies with `sendto` to the peer
+    /// address it saw, so an unbound datagram socket would never get an ack.
+    pub fn connect(psp_path: impl AsRef<Path>) -> Result<Self> {
+        let psp_path = psp_path.as_ref().to_path_buf();
+        let our_path = PathBuf::from(format!("/tmp/besom-ctl-{}.sock", std::process::id()));
+
+        let _ = std::fs::remove_file(&our_path);
+        let sock = UnixDatagram::bind(&our_path)
+            .with_context(|| format!("binding besom control socket {}", our_path.display()))?;
+        sock.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+        Ok(Self { sock, psp_path, our_path, sim_usec: 0 })
+    }
+
+    /// Simulated microseconds granted so far.
+    pub fn sim_usec(&self) -> u64 {
+        self.sim_usec
+    }
+
+    /// Grant one tick and block until cFE has dispatched it.
+    pub fn step(&mut self, usec: u32) -> Result<u64> {
+        assert!(usec > 0, "a zero step would tell the PSP no time has passed");
+
+        self.sock
+            .send_to(&usec.to_le_bytes(), &self.psp_path)
+            .with_context(|| format!("sending step to {}", self.psp_path.display()))?;
+
+        let mut reply = [0u8; 8];
+        let (n, _) = self
+            .sock
+            .recv_from(&mut reply)
+            .context("cFS did not acknowledge the step (is it running on timebase_besom?)")?;
+        anyhow::ensure!(n == 8, "malformed step ack: {n} bytes");
+
+        self.sim_usec = u64::from_le_bytes(reply);
+        Ok(self.sim_usec)
+    }
+
+    /// Grant `n` ticks of the default period.
+    pub fn step_ticks(&mut self, n: u32) -> Result<u64> {
+        for _ in 0..n {
+            self.step(TICK_USEC)?;
+        }
+        Ok(self.sim_usec)
+    }
+}
+
+impl Drop for Clock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.our_path);
+    }
+}
