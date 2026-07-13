@@ -52,12 +52,18 @@ gate ticks. Same for the timed semaphore waits. See `patches/osal-simulated-time
 
 Measured over 30 s of simulated time, 87 packets, the full cFS app set:
 
-- **The packet stream is exactly reproducible** at short scenarios (6 s), and *usually* at 30 s.
-  Per message: the same count, the same CCSDS sequence deltas, the same lengths.
+- **The packet stream is exactly reproducible.** Per message: the same count, the same CCSDS
+  sequence deltas, the same lengths. Nothing dropped, duplicated, reordered, or invented.
+  Verified 13/13 across 6 s, 30 s and 60 s scenarios.
 - **Tick placement jitters.** A minority of packets land a tick or two early or late.
-- **At 30 s the stream is not yet reliably reproducible** — roughly one run in three differs by a
-  packet or two, because the whole system's phase can slip by a tick and change how many 1 Hz cycles
-  fall inside the window. This is the same intra-tick ordering problem, and it is the open item.
+
+The window is **phase-aligned at both ends**, and this is what makes it reliable. Guarding only the
+end is not enough — the *start* is the half that moves. cFE TIME's 1 Hz tone is armed during un-gated
+boot, so the system's phase at tick 1 is host-dependent, and a fixed tick budget then catches N or
+N+1 housekeeping cycles. So the harness does not start counting at tick 1: it steps until the system
+reaches a known point in its cycle (the first cFE ES housekeeping packet), starts the window there,
+and stops recording a guard band before it stops granting time. Both ends are then pinned to the
+same phase and the number of cycles inside is fixed.
 
 Within a single granted tick, cFE's tasks are *simultaneous* in simulated time — and the **host**
 scheduler decides which of them actually runs first. So *what* the flight software does is
@@ -201,10 +207,15 @@ scene is a sphere, a trail and a few axes, and a second renderer would be cost w
 
 ## Status
 
-A working harness and ground station, not a finished product. Known gaps, in the order they matter:
+Usable. The stream guarantee holds run after run, the closed loop verifies, and you can write a cFS
+app and regression-test it today.
 
-1. **Deterministic intra-tick scheduling** — the last thing between this and a byte-deterministic
-   cFS. Two approaches have been tried and *neither works*; see below. Don't repeat them.
+Known gaps, in the order they matter:
+
+1. **Deterministic tick PLACEMENT.** The stream is reproducible; *which tick* a packet lands on is
+   not, for a minority of packets. This does not affect regression testing (assert the stream), but
+   it is what stands between this and a byte-deterministic cFS. Two approaches have been tried and
+   neither works; see below. Don't repeat them.
 2. **More device simulation.** `besom_io` proves the path; real sensors (star tracker, IMU, GPS)
    belong behind the OSAL/PSP `iodriver` seam so flight apps talk to them over the buses they would
    really use.

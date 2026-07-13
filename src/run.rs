@@ -203,8 +203,48 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     up.send_to(&fsw::add_packet_command(fsw::STATE_TLM_MID), ("127.0.0.1", CI_PORT))?;
     quiesce::wait(cfs.pid());
 
-    // Anything emitted while enabling is boot history; the run starts at tick 1.
+    // Anything emitted while enabling is boot history.
     drain(&tlm, &mut Transcript::new());
+
+    // PHASE-ALIGN THE START.
+    //
+    // The end of the window was guarded, but not the beginning -- and the
+    // beginning is the half that actually moves. cFE TIME's 1 Hz tone is armed
+    // during un-gated boot, so the system's phase at tick 1 is host-dependent: a
+    // fixed tick budget therefore catches N or N+1 housekeeping cycles, and the
+    // packet count wobbles by a packet or two between runs. That is what made 30 s
+    // checks fail about one run in three.
+    //
+    // So do not start counting at tick 1. Step until the system reaches a KNOWN
+    // point in its cycle -- the first cFE ES housekeeping packet, which is emitted
+    // once per 1 Hz cycle -- and start the window there. Both ends of the window
+    // are then pinned to the same phase, and the number of cycles inside it is
+    // fixed.
+    const SYNC_MID: u16 = 0x0800; // cFE ES housekeeping: one per 1 Hz cycle
+    // Generous: the first housekeeping cycle can take a few hundred ticks to
+    // appear, because SCH_LAB will not run its table until it has seen a 1 Hz
+    // packet from CFE_TIME.
+    const SYNC_LIMIT: u32 = 1500;
+
+    let mut synced = false;
+    for _ in 0..SYNC_LIMIT {
+        let _ = sensors.send_to(&fsw::encode_state(&vehicle), ("127.0.0.1", fsw::STATE_PORT));
+        clock.step(TICK_USEC)?;
+        quiesce::wait(cfs.pid());
+        vehicle.step(f64::from(TICK_USEC) / 1e6);
+
+        let mut probe = Transcript::new();
+        drain(&tlm, &mut probe);
+
+        if probe.entries().iter().any(|e| e.msg_id == SYNC_MID) {
+            synced = true;
+            break;
+        }
+    }
+
+    if !synced {
+        bail!("cFS never emitted a housekeeping cycle -- cannot phase-align the run");
+    }
 
     // GUARD BAND: stop RECORDING before we stop GRANTING TIME.
     //
