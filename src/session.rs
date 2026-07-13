@@ -16,7 +16,7 @@ use crate::evs::{self, Event};
 use crate::fsw::{self, FswState};
 use crate::quiesce;
 use crate::run::{Cfs, Config, CI_PORT, TLM_PORT};
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::net::UdpSocket;
@@ -147,10 +147,36 @@ fn drive(cfg: Config, rx: Receiver<Cmd>, state: &Arc<Mutex<State>>) -> Result<()
 
     // Enable the downlink with the clock still frozen, so it takes effect at an
     // exact simulated instant rather than whenever the host got round to it.
+    //
+    // `Cfs::boot` returns as soon as the PSP binds the step socket -- it does NOT
+    // wait for the apps. CI_LAB binds UDP 1234 some time later, and an uplink sent
+    // before that bind is a datagram sent to a closed port: dropped, in silence.
+    // TO_LAB then sits at "Awaiting enable command" forever and no telemetry is
+    // ever downlinked, while the harness looks entirely healthy.
+    //
+    // So: wait for the bind, then confirm the enable was ACKED. Waiting on
+    // "TO_LAB 19" (subscribed-to-table) proved nothing -- that is a boot event and
+    // fires whether or not the enable arrived. TO_LAB_TLMOUTENA_INF_EID (3) is the
+    // enable itself. Resend while waiting; a command lost in the gap is invisible
+    // to us and only a retry recovers it.
+    cfs.await_log_public("CI_LAB listening on UDP port", Duration::from_secs(10))
+        .context("CI_LAB never bound its command port")?;
+
     let mut ip = [0u8; 16];
     ip[..9].copy_from_slice(b"127.0.0.1");
-    uplink.send_to(&build_command(0x1880, 6, &ip), ("127.0.0.1", CI_PORT))?;
-    let _ = cfs.await_log_public("TO_LAB 19", Duration::from_secs(10));
+    let enable = build_command(0x1880, 6, &ip);
+
+    let mut enabled = false;
+    for _ in 0..25 {
+        uplink.send_to(&enable, ("127.0.0.1", CI_PORT))?;
+        if cfs.await_log_public("TO_LAB 3", Duration::from_millis(200)).is_ok() {
+            enabled = true;
+            break;
+        }
+    }
+    if !enabled {
+        bail!("TO_LAB never acknowledged the enable-output command; there would be no downlink");
+    }
 
     // TO_LAB's subscription table is baked in at build time and does not carry
     // besom_io's telemetry, so subscribe it at runtime -- what a real operator
