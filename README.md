@@ -125,6 +125,29 @@ cargo run --release --bin besom            # the ground station
 Without `$BESOM_STEP_SOCK` set, `timebase_besom` free-runs exactly like stock `soft_timebase`, so a
 patched PSP stays usable for ordinary (non-simulated) runs.
 
+## Intra-tick determinism: two things that don't work
+
+Recorded because both are the obvious ideas, and both are dead ends.
+
+**Pinning cFS to a single CPU does not help.** If the tasks cannot run simultaneously, surely the
+kernel must order them? Measured: placement jitter got *worse*. The quiescence poller ends up
+contending with cFS for the same core.
+
+**A cooperative token scheduler is not sufficient either.** `$BESOM_COOP=1` enables one in OSAL
+(shipped, off by default, does not deadlock): only one task runs at a time, and the token passes to
+the lowest-numbered *waiting* task, with task ids fixed by creation order. It does not make runs
+deterministic, and the reason is worth understanding:
+
+> The token only orders the tasks **already waiting for it**. When a tick wakes several tasks, each
+> becomes a waiter whenever its thread happens to get scheduled off its semaphore — so a
+> high-numbered task that wakes fast can take the token before a low-numbered task has even arrived
+> to ask for it. **Readiness is still observed asynchronously.** The race moved; it did not go away.
+
+To actually fix it, OSAL's blocking primitives have to be reimplemented *on top of* the scheduler:
+the task that performs a `give` must mark the receiver ready **at that instant**, rather than the
+receiver marking itself ready whenever Linux gets round to waking it. That is a real rewrite of the
+POSIX layer's semaphores and queues, and it is the honest next step.
+
 ## The dynamics
 
 Two-body gravity, fixed-step RK4, integrated on the simulated tick — so the trajectory is
@@ -154,9 +177,7 @@ scene is a sphere, a trail and a few axes, and a second renderer would be cost w
 A working harness and ground station, not a finished product. Known gaps, in the order they matter:
 
 1. **Deterministic intra-tick scheduling** — the last thing between this and a byte-deterministic
-   cFS. (Pinning cFS to a single CPU does *not* achieve it — measured, and it made placement worse.
-   It needs cooperative scheduling inside OSAL, so that only one task runs at a time in a defined
-   order.)
+   cFS. Two approaches have been tried and *neither works*; see below. Don't repeat them.
 2. **More device simulation.** `besom_io` proves the path; real sensors (star tracker, IMU, GPS)
    belong behind the OSAL/PSP `iodriver` seam so flight apps talk to them over the buses they would
    really use.

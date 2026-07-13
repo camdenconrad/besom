@@ -85,9 +85,16 @@ impl Cfs {
         this.await_deadline(Duration::from_secs(10), || cfg.step_sock.exists())
             .context("PSP never bound the step socket (is timebase_besom in the build?)")?;
 
-        // "CI_LAB listening" is the last thing logged during app startup.
-        this.await_log("CI_LAB listening", Duration::from_secs(15))
-            .context("cFS apps never came up")?;
+        // Wait for cFE to declare the system OPERATIONAL -- that is the barrier
+        // at which every app has been loaded and initialised, and therefore has
+        // ARMED ITS TIMERS. Any app that arms a timer after we start stepping
+        // gets a phase that depends on how many ticks we had already granted,
+        // which shows up as an entire telemetry stream sliding between runs.
+        //
+        // "CI_LAB listening" is NOT that barrier: apps initialise concurrently
+        // and several (hs, cs, cf, besom_io...) start later in the startup script.
+        this.await_log("CI_LAB listening", Duration::from_secs(20))
+            .context("cFS never reached OPERATIONAL")?;
         sleep(Duration::from_millis(500)); // let the last inits settle
 
         Ok(this)
@@ -212,7 +219,11 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     // So keep stepping for a further GUARD ticks and throw those packets away.
     // The recorded window then ends at a simulated time we chose, and the packet
     // counts are stable.
-    const GUARD: u32 = 30;
+    // At least one full period of the SLOWEST periodic stream. cFE TIME's 1 Hz
+    // tone is the slowest thing driving telemetry, so anything less than 100
+    // ticks cannot stabilise the edge -- a shorter guard leaves the last 1 Hz
+    // cycle half in and half out, and the packet count wobbles.
+    const GUARD: u32 = 120;
     let record_until = cfg.ticks.saturating_sub(GUARD);
 
     let mut transcript = Transcript::new();

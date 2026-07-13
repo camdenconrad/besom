@@ -189,10 +189,10 @@ index 562abebb..49c8728a 100644
      } /* END timeout */
  
 diff --git a/src/os/posix/src/os-impl-tasks.c b/src/os/posix/src/os-impl-tasks.c
-index a7d9cb46..419d100d 100644
+index a7d9cb46..e9e65165 100644
 --- a/src/os/posix/src/os-impl-tasks.c
 +++ b/src/os/posix/src/os-impl-tasks.c
-@@ -748,11 +748,133 @@ void OS_TaskExit_Impl(void)
+@@ -748,11 +748,270 @@ void OS_TaskExit_Impl(void)
   *           See prototype for argument/return detail
   *
   *-----------------------------------------------------------------*/
@@ -243,6 +243,143 @@ index a7d9cb46..419d100d 100644
 +    OS_SimTime.active = true;
 +    pthread_cond_broadcast(&OS_SimTime.cond);
 +    pthread_mutex_unlock(&OS_SimTime.mutex);
++}
++
++/*
++ * ---- Cooperative deterministic scheduler (Besom) ----
++ *
++ * The last source of nondeterminism after the clock is under control: within a
++ * single granted tick, several cFE tasks become runnable at once and the HOST
++ * scheduler picks the order. Whichever runs first sees a different world, so an
++ * event can land on this tick or the next, and whole telemetry streams slide.
++ *
++ * The fix is a token. Only one OSAL task executes at a time, and when a task
++ * blocks it hands the token to the LOWEST-NUMBERED task waiting for it. Task ids
++ * are assigned in creation order, which is fixed by the startup script -- so the
++ * order in which runnable tasks execute is fixed too, and does not depend on
++ * Linux.
++ *
++ * This is not free: cFS loses real parallelism, so it runs slower in wall-clock
++ * terms. In a simulation that is the correct trade -- there is no physical rate
++ * to keep up with, only reproducibility to preserve.
++ *
++ * ENABLED BY $BESOM_COOP. Off by default: every blocking call in OSAL has to
++ * release the token, and any blocking path that is missed would deadlock the
++ * whole flight software rather than merely perturb it. Opt-in keeps that risk
++ * away from ordinary runs.
++ */
++#define OS_COOP_MAX_WAITERS 64
++
++static struct
++{
++    pthread_mutex_t mutex;
++    pthread_cond_t  cond;
++    bool            enabled;
++    bool            held;
++    uint32          waiters[OS_COOP_MAX_WAITERS];
++    uint32          n_waiters;
++} OS_Coop = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, false, false, {0}, 0};
++
++/* This thread's place in the deterministic order. Lower goes first. */
++static __thread uint32 OS_Coop_Key = 0;
++static __thread bool   OS_Coop_Joined = false;
++
++void OS_Coop_Init_Impl(void)
++{
++    const char *env = getenv("BESOM_COOP");
++    OS_Coop.enabled = (env != NULL && env[0] == '1');
++
++    if (OS_Coop.enabled)
++    {
++        printf("OSAL(besom): cooperative deterministic scheduler ENABLED\n");
++    }
++}
++
++bool OS_Coop_Enabled_Impl(void)
++{
++    return OS_Coop.enabled;
++}
++
++static bool OS_Coop_IsNext(uint32 key)
++{
++    uint32 i;
++
++    for (i = 0; i < OS_Coop.n_waiters; ++i)
++    {
++        if (OS_Coop.waiters[i] < key)
++        {
++            return false; /* someone earlier in the order is waiting */
++        }
++    }
++    return true;
++}
++
++/* Take the token. Blocks until it is free AND we are the lowest waiter. */
++void OS_Coop_Acquire_Impl(void)
++{
++    if (!OS_Coop.enabled || !OS_Coop_Joined)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++
++    if (OS_Coop.n_waiters < OS_COOP_MAX_WAITERS)
++    {
++        OS_Coop.waiters[OS_Coop.n_waiters++] = OS_Coop_Key;
++    }
++
++    while (OS_Coop.held || !OS_Coop_IsNext(OS_Coop_Key))
++    {
++        pthread_cond_wait(&OS_Coop.cond, &OS_Coop.mutex);
++    }
++
++    /* Remove ourselves from the waiting set. */
++    for (uint32 i = 0; i < OS_Coop.n_waiters; ++i)
++    {
++        if (OS_Coop.waiters[i] == OS_Coop_Key)
++        {
++            OS_Coop.waiters[i] = OS_Coop.waiters[--OS_Coop.n_waiters];
++            break;
++        }
++    }
++
++    OS_Coop.held = true;
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++/* Give up the token -- called before any blocking operation. */
++void OS_Coop_Release_Impl(void)
++{
++    if (!OS_Coop.enabled || !OS_Coop_Joined)
++    {
++        return;
++    }
++
++    pthread_mutex_lock(&OS_Coop.mutex);
++    OS_Coop.held = false;
++    pthread_cond_broadcast(&OS_Coop.cond);
++    pthread_mutex_unlock(&OS_Coop.mutex);
++}
++
++/*
++ * Join the scheduler with a fixed place in the order.
++ *
++ * `key` must be stable across runs: it is what makes the execution order
++ * reproducible. OSAL task ids are assigned in creation order, which the startup
++ * script fixes, so they serve.
++ */
++void OS_Coop_Join_Impl(uint32 key)
++{
++    if (!OS_Coop.enabled)
++    {
++        return;
++    }
++
++    OS_Coop_Key    = key;
++    OS_Coop_Joined = true;
++
++    OS_Coop_Acquire_Impl();
 +}
 +
 +/*
@@ -327,7 +464,7 @@ index a7d9cb46..419d100d 100644
      sleep_end.tv_sec  += millisecond / 1000;
      sleep_end.tv_nsec += 1000000 * (millisecond % 1000);
 diff --git a/src/os/shared/inc/os-shared-timebase.h b/src/os/shared/inc/os-shared-timebase.h
-index 5ee19111..151d62bc 100644
+index 5ee19111..5d3733c6 100644
 --- a/src/os/shared/inc/os-shared-timebase.h
 +++ b/src/os/shared/inc/os-shared-timebase.h
 @@ -33,6 +33,7 @@ typedef struct
@@ -338,7 +475,7 @@ index 5ee19111..151d62bc 100644
      uint32         accuracy_usec;
      osal_id_t      first_cb;
      uint32         freerun_time;
-@@ -40,6 +41,27 @@ typedef struct
+@@ -40,6 +41,70 @@ typedef struct
      uint32         nominal_interval_time;
  } OS_timebase_internal_record_t;
  
@@ -363,14 +500,283 @@ index 5ee19111..151d62bc 100644
 +unsigned long long OS_SimTime_GetUsec_Impl(void);
 +void               OS_SimTime_WaitTick_Impl(unsigned long long until_usec);
 +
++/*
++ * Cooperative deterministic scheduler ($BESOM_COOP).
++ *
++ * Only one task runs at a time, and the token passes to the lowest-numbered
++ * waiting task -- so the order in which runnable tasks execute is fixed by task
++ * creation order rather than by the host scheduler.
++ *
++ * EVERY blocking call must Release before it pends and Acquire after it wakes.
++ * A blocking path that forgets to will deadlock the flight software, not merely
++ * perturb it -- which is why this is opt-in.
++ */
++void OS_Coop_Init_Impl(void);
++bool OS_Coop_Enabled_Impl(void);
++void OS_Coop_Join_Impl(uint32 key);
++void OS_Coop_Acquire_Impl(void);
++void OS_Coop_Release_Impl(void);
++
++/*
++ * Weak no-op fallbacks, defined per translation unit.
++ *
++ * They live in the header rather than one source file because OSAL's coverage
++ * tests compile each shared source in ISOLATION against stubbed OS
++ * implementations -- so a definition in any single .c would not be visible to
++ * them, and every wrapped blocking call would fail to link. Weak linkage lets the
++ * real POSIX implementations override these wherever they are present.
++ */
++__attribute__((weak)) void OS_Coop_Init_Impl(void) {}
++__attribute__((weak)) void OS_Coop_Join_Impl(uint32 key)
++{
++    (void)key;
++}
++__attribute__((weak)) void OS_Coop_Acquire_Impl(void) {}
++__attribute__((weak)) void OS_Coop_Release_Impl(void) {}
++
++/** RAII-ish helper: bracket a blocking call so the token is always given up. */
++#define OS_COOP_BLOCKING(expr)     \
++    do                             \
++    {                              \
++        OS_Coop_Release_Impl();    \
++        (expr);                    \
++        OS_Coop_Acquire_Impl();    \
++    } while (0)
++
  /*
   * These record types have extra information with each entry.  These tables are used
   * to share extra data between the common layer and the OS-specific implementation.
+diff --git a/src/os/shared/src/osapi-binsem.c b/src/os/shared/src/osapi-binsem.c
+index 726694e4..5656e914 100644
+--- a/src/os/shared/src/osapi-binsem.c
++++ b/src/os/shared/src/osapi-binsem.c
+@@ -38,6 +38,7 @@
+  */
+ #include "os-shared-binsem.h"
+ #include "os-shared-idmap.h"
++#include "os-shared-timebase.h" /* cooperative scheduler hooks */
+ 
+ /*
+  * Sanity checks on the user-supplied configuration
+@@ -197,7 +198,7 @@ int32 OS_BinSemTake(osal_id_t sem_id)
+     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_NONE, LOCAL_OBJID_TYPE, sem_id, &token);
+     if (return_code == OS_SUCCESS)
+     {
+-        return_code = OS_BinSemTake_Impl(&token);
++        OS_COOP_BLOCKING(return_code = OS_BinSemTake_Impl(&token));
+     }
+ 
+     return return_code;
+@@ -218,7 +219,7 @@ int32 OS_BinSemTimedWait(osal_id_t sem_id, uint32 msecs)
+     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_NONE, LOCAL_OBJID_TYPE, sem_id, &token);
+     if (return_code == OS_SUCCESS)
+     {
+-        return_code = OS_BinSemTimedWait_Impl(&token, msecs);
++        OS_COOP_BLOCKING(return_code = OS_BinSemTimedWait_Impl(&token, msecs));
+     }
+ 
+     return return_code;
+diff --git a/src/os/shared/src/osapi-common.c b/src/os/shared/src/osapi-common.c
+index 7f2c397f..dbdab068 100644
+--- a/src/os/shared/src/osapi-common.c
++++ b/src/os/shared/src/osapi-common.c
+@@ -103,6 +103,9 @@ int32 OS_NotifyEvent(OS_Event_t event, osal_id_t object_id, void *data)
+  *-----------------------------------------------------------------*/
+ int32 OS_API_Init(void)
+ {
++    /* Read $BESOM_COOP once, before any task exists. */
++    OS_Coop_Init_Impl();
++
+     int32          return_code = OS_SUCCESS;
+     osal_objtype_t idtype;
+     uint32         microSecPerSec;
+diff --git a/src/os/shared/src/osapi-countsem.c b/src/os/shared/src/osapi-countsem.c
+index b1ac5e63..d4fc87e6 100644
+--- a/src/os/shared/src/osapi-countsem.c
++++ b/src/os/shared/src/osapi-countsem.c
+@@ -38,6 +38,7 @@
+  */
+ #include "os-shared-countsem.h"
+ #include "os-shared-idmap.h"
++#include "os-shared-timebase.h" /* cooperative scheduler hooks */
+ 
+ /*
+  * Sanity checks on the user-supplied configuration
+@@ -168,7 +169,7 @@ int32 OS_CountSemTake(osal_id_t sem_id)
+     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_NONE, LOCAL_OBJID_TYPE, sem_id, &token);
+     if (return_code == OS_SUCCESS)
+     {
+-        return_code = OS_CountSemTake_Impl(&token);
++        OS_COOP_BLOCKING(return_code = OS_CountSemTake_Impl(&token));
+     }
+ 
+     return return_code;
+@@ -189,7 +190,7 @@ int32 OS_CountSemTimedWait(osal_id_t sem_id, uint32 msecs)
+     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_NONE, LOCAL_OBJID_TYPE, sem_id, &token);
+     if (return_code == OS_SUCCESS)
+     {
+-        return_code = OS_CountSemTimedWait_Impl(&token, msecs);
++        OS_COOP_BLOCKING(return_code = OS_CountSemTimedWait_Impl(&token, msecs));
+     }
+ 
+     return return_code;
+diff --git a/src/os/shared/src/osapi-queue.c b/src/os/shared/src/osapi-queue.c
+index 2e5fe814..236f44ab 100644
+--- a/src/os/shared/src/osapi-queue.c
++++ b/src/os/shared/src/osapi-queue.c
+@@ -42,6 +42,7 @@
+  */
+ #include "os-shared-queue.h"
+ #include "os-shared-idmap.h"
++#include "os-shared-timebase.h" /* cooperative scheduler hooks */
+ 
+ /*
+  * Sanity checks on the user-supplied configuration
+@@ -174,7 +175,7 @@ int32 OS_QueueGet(osal_id_t queue_id, void *data, size_t size, size_t *size_copi
+         }
+         else
+         {
+-            return_code = OS_QueueGet_Impl(&token, data, size, size_copied, timeout);
++            OS_COOP_BLOCKING(return_code = OS_QueueGet_Impl(&token, data, size, size_copied, timeout));
+         }
+     }
+ 
+@@ -211,7 +212,7 @@ int32 OS_QueuePut(osal_id_t queue_id, const void *data, size_t size, uint32 flag
+         }
+         else
+         {
+-            return_code = OS_QueuePut_Impl(&token, data, size, flags);
++            OS_COOP_BLOCKING(return_code = OS_QueuePut_Impl(&token, data, size, flags));
+         }
+     }
+ 
+diff --git a/src/os/shared/src/osapi-select.c b/src/os/shared/src/osapi-select.c
+index 25f7d949..57a618e4 100644
+--- a/src/os/shared/src/osapi-select.c
++++ b/src/os/shared/src/osapi-select.c
+@@ -41,6 +41,7 @@
+  */
+ #include "os-shared-idmap.h"
+ #include "os-shared-select.h"
++#include "os-shared-timebase.h" /* cooperative scheduler hooks */
+ 
+ /*
+  *********************************************************************************
+@@ -65,7 +66,7 @@ int32 OS_SelectSingleAbs(osal_id_t objid, uint32 *StateFlags, OS_time_t abs_time
+     return_code = OS_ObjectIdGetById(OS_LOCK_MODE_REFCOUNT, OS_OBJECT_TYPE_OS_STREAM, objid, &token);
+     if (return_code == OS_SUCCESS)
+     {
+-        return_code = OS_SelectSingle_Impl(&token, StateFlags, abs_timeout);
++        OS_COOP_BLOCKING(return_code = OS_SelectSingle_Impl(&token, StateFlags, abs_timeout));
+ 
+         OS_ObjectIdRelease(&token);
+     }
+@@ -105,7 +106,7 @@ int32 OS_SelectMultipleAbs(OS_FdSet *ReadSet, OS_FdSet *WriteSet, OS_time_t abs_
+      * That means a file/socket can be closed while actively inside a
+      * OS_SelectMultiple() call in another thread.
+      */
+-    return_code = OS_SelectMultiple_Impl(ReadSet, WriteSet, abs_timeout);
++    OS_COOP_BLOCKING(return_code = OS_SelectMultiple_Impl(ReadSet, WriteSet, abs_timeout));
+ 
+     return return_code;
+ }
+diff --git a/src/os/shared/src/osapi-sockets.c b/src/os/shared/src/osapi-sockets.c
+index 1f58ed5a..4c43e2b7 100644
+--- a/src/os/shared/src/osapi-sockets.c
++++ b/src/os/shared/src/osapi-sockets.c
+@@ -41,6 +41,7 @@
+ #include "os-shared-file.h"
+ #include "os-shared-sockets.h"
+ #include "os-shared-common.h"
++#include "os-shared-timebase.h" /* cooperative scheduler hooks */
+ 
+ /*
+  * Other OSAL public APIs used by this module
+@@ -342,7 +343,7 @@ int32 OS_SocketAcceptAbs(osal_id_t sock_id, osal_id_t *connsock_id, OS_SockAddr_
+ 
+                 OS_SocketAddrInit_Impl(Addr, sock->socket_domain);
+ 
+-                return_code = OS_SocketAccept_Impl(&sock_token, &conn_token, Addr, abs_timeout);
++                OS_COOP_BLOCKING(return_code = OS_SocketAccept_Impl(&sock_token, &conn_token, Addr, abs_timeout));
+ 
+                 if (return_code == OS_SUCCESS)
+                 {
+@@ -404,7 +405,7 @@ int32 OS_SocketConnectAbs(osal_id_t sock_id, const OS_SockAddr_t *Addr, OS_time_
+         }
+         else
+         {
+-            return_code = OS_SocketConnect_Impl(&token, Addr, abs_timeout);
++            OS_COOP_BLOCKING(return_code = OS_SocketConnect_Impl(&token, Addr, abs_timeout));
+ 
+             if (return_code == OS_SUCCESS)
+             {
+@@ -523,7 +524,7 @@ int32 OS_SocketRecvFromAbs(osal_id_t      sock_id,
+         }
+         else
+         {
+-            return_code = OS_SocketRecvFrom_Impl(&token, buffer, buflen, RemoteAddr, abs_timeout);
++            OS_COOP_BLOCKING(return_code = OS_SocketRecvFrom_Impl(&token, buffer, buflen, RemoteAddr, abs_timeout));
+         }
+ 
+         OS_ObjectIdRelease(&token);
+diff --git a/src/os/shared/src/osapi-task.c b/src/os/shared/src/osapi-task.c
+index 20e697d2..85058975 100644
+--- a/src/os/shared/src/osapi-task.c
++++ b/src/os/shared/src/osapi-task.c
+@@ -44,6 +44,7 @@
+ #include "os-shared-task.h"
+ #include "os-shared-common.h"
+ #include "os-shared-idmap.h"
++#include "os-shared-timebase.h" /* cooperative scheduler hooks */
+ 
+ /*
+  * Sanity checks on the user-supplied configuration
+@@ -125,6 +126,17 @@ void OS_TaskEntryPoint(osal_id_t task_id)
+ {
+     osal_task_entry task_entry;
+ 
++    /*
++     * Join the cooperative scheduler before running any task code.
++     *
++     * The key is the OSAL task id, which is assigned in creation order -- fixed
++     * by the startup script, and therefore identical across runs. That is what
++     * makes the execution order reproducible: when several tasks are woken by the
++     * same tick, the lowest id always runs first, rather than whichever one Linux
++     * happened to schedule.
++     */
++    OS_Coop_Join_Impl(OS_ObjectIdToInteger(task_id));
++
+     if (OS_TaskPrepare(task_id, &task_entry) == OS_SUCCESS)
+     {
+         if (task_entry != NULL)
+@@ -133,6 +145,9 @@ void OS_TaskEntryPoint(osal_id_t task_id)
+         }
+     }
+ 
++    /* Hand the token on before we disappear, or everyone else waits forever. */
++    OS_Coop_Release_Impl();
++
+     /* If the function returns, treat as a normal exit and do the proper cleanup */
+     OS_TaskExit();
+ }
+@@ -284,7 +299,11 @@ void OS_TaskExit(void)
+ int32 OS_TaskDelay(uint32 millisecond)
+ {
+     /* just call the implementation */
+-    return OS_TaskDelay_Impl(millisecond);
++    int32 return_code;
++
++    OS_COOP_BLOCKING(return_code = OS_TaskDelay_Impl(millisecond));
++
++    return return_code;
+ }
+ 
+ /*----------------------------------------------------------------
 diff --git a/src/os/shared/src/osapi-timebase.c b/src/os/shared/src/osapi-timebase.c
-index e5db0ebb..d3cd158b 100644
+index e5db0ebb..bb54950c 100644
 --- a/src/os/shared/src/osapi-timebase.c
 +++ b/src/os/shared/src/osapi-timebase.c
-@@ -84,6 +84,25 @@ int32 OS_TimeBaseAPI_Init(void)
+@@ -84,6 +84,26 @@ int32 OS_TimeBaseAPI_Init(void)
      return OS_SUCCESS;
  }
  
@@ -393,10 +799,11 @@ index e5db0ebb..d3cd158b 100644
 +}
 +__attribute__((weak)) void OS_SimTime_WaitTick_Impl(unsigned long long until_usec) {}
 +
++
  /*----------------------------------------------------------------
   *
   *  Purpose: Implemented per public OSAL API
-@@ -127,7 +146,8 @@ int32 OS_TimeBaseCreate(osal_id_t *timebase_id, const char *timebase_name, OS_Ti
+@@ -127,7 +147,8 @@ int32 OS_TimeBaseCreate(osal_id_t *timebase_id, const char *timebase_name, OS_Ti
          /* Reset the table entry and save the name */
          OS_OBJECT_INIT(token, timebase, timebase_name, timebase_name);
  
@@ -406,7 +813,7 @@ index e5db0ebb..d3cd158b 100644
          if (external_sync == NULL)
          {
              timebase->accuracy_usec = OS_SharedGlobalVars.MicroSecPerTick;
-@@ -373,6 +393,7 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
+@@ -373,6 +394,7 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
      uint32                         tick_time;
      uint32                         spin_cycles;
      int32                          saved_wait_time;
@@ -414,7 +821,7 @@ index e5db0ebb..d3cd158b 100644
  
      /*
       * Register this task as a time base handler.
-@@ -392,11 +413,19 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
+@@ -392,18 +414,36 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
      record   = OS_OBJECT_TABLE_GET(OS_global_timebase_table, token);
      timebase = OS_OBJECT_TABLE_GET(OS_timebase_table, token);
  
@@ -433,10 +840,28 @@ index e5db0ebb..d3cd158b 100644
 +     */
 +    OS_SimTime_MarkTickThread_Impl();
 +
++    /*
++     * The tick thread joins the scheduler FIRST (key 0), so that when it grants a
++     * tick it dispatches the timer callbacks -- which wake the tasks -- before any
++     * of those tasks get to run.
++     */
++    OS_Coop_Join_Impl(0);
++
      while (1)
      {
          /*
-@@ -458,6 +487,18 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
+          * Call the sync function - this will pend for some period of time
+          * and return the amount of elapsed time in units of "timebase ticks"
+          */
+-        tick_time = (*syncfunc)(timebase_id);
++        /* Pending on the harness must not hold the token: every task would
++         * stall until the next tick was granted, which is a deadlock in all but
++         * name. */
++        OS_COOP_BLOCKING(tick_time = (*syncfunc)(timebase_id));
+ 
+         /*
+          * The returned tick_time should be nonzero.  If the sync function
+@@ -458,6 +498,18 @@ void OS_TimeBase_CallbackThread(osal_id_t timebase_id)
          }
  
          timebase->freerun_time += tick_time;
