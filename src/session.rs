@@ -13,6 +13,7 @@ use crate::ccsds::{build_command, TlmPacket};
 use crate::clock::{Clock, TICK_USEC};
 use crate::dynamics::{Vec3, Vehicle};
 use crate::evs::{self, Event};
+use crate::fsw::{self, FswState};
 use crate::quiesce;
 use crate::run::{Cfs, Config, CI_PORT, TLM_PORT};
 use anyhow::Result;
@@ -66,6 +67,9 @@ pub struct State {
     pub vehicle: Vehicle,
     /// Recent positions, for the orbit trail.
     pub trail: Vec<Vec3>,
+    /// Vehicle state as the FLIGHT SOFTWARE reports it, round-tripped through
+    /// cFS. If this diverges from `vehicle`, the loop is broken.
+    pub fsw: Option<FswState>,
     /// cFE's absolute MET at the first packet. Its epoch is a large constant
     /// that also varies run to run (cFE TIME settles on a 5-second quantum at
     /// boot), so showing it raw is both ugly and misleading. Packet times are
@@ -139,6 +143,7 @@ fn drive(cfg: Config, rx: Receiver<Cmd>, state: &Arc<Mutex<State>>) -> Result<()
     let tlm = UdpSocket::bind(("0.0.0.0", TLM_PORT))?;
     tlm.set_nonblocking(true)?;
     let uplink = UdpSocket::bind(("0.0.0.0", 0))?;
+    let sensors = UdpSocket::bind(("0.0.0.0", 0))?; // vehicle state -> besom_io
 
     // Enable the downlink with the clock still frozen, so it takes effect at an
     // exact simulated instant rather than whenever the host got round to it.
@@ -146,6 +151,11 @@ fn drive(cfg: Config, rx: Receiver<Cmd>, state: &Arc<Mutex<State>>) -> Result<()
     ip[..9].copy_from_slice(b"127.0.0.1");
     uplink.send_to(&build_command(0x1880, 6, &ip), ("127.0.0.1", CI_PORT))?;
     let _ = cfs.await_log_public("TO_LAB 19", Duration::from_secs(10));
+
+    // TO_LAB's subscription table is baked in at build time and does not carry
+    // besom_io's telemetry, so subscribe it at runtime -- what a real operator
+    // would do.
+    uplink.send_to(&fsw::add_packet_command(fsw::STATE_TLM_MID), ("127.0.0.1", CI_PORT))?;
     quiesce::wait(cfs.pid());
 
     state.lock().unwrap().alive = true;
@@ -198,16 +208,26 @@ fn drive(cfg: Config, rx: Receiver<Cmd>, state: &Arc<Mutex<State>>) -> Result<()
             // changes how fast we drive cFS -- never whether it keeps up.
             let n = if budget > 0 { 1 } else { warp };
             for _ in 0..n {
+                // Deliver sensor data BEFORE granting the tick that lets the
+                // flight software look for it. besom_io reads its socket
+                // non-blocking on a sim-clock timer, so the datagram must already
+                // be waiting -- otherwise whether cFS sees this tick's state
+                // depends on host scheduling, and the run stops being reproducible.
+                {
+                    let s = state.lock().unwrap();
+                    let _ = sensors.send_to(&fsw::encode_state(&s.vehicle), ("127.0.0.1", fsw::STATE_PORT));
+                }
+
                 clock.step(TICK_USEC)?;
                 quiesce::wait(cfs.pid());
+
+                // Propagate between ticks so the state we send next tick is the
+                // state at that tick.
+                state.lock().unwrap().vehicle.step(f64::from(TICK_USEC) / 1e6);
             }
             budget = budget.saturating_sub(1);
 
-            // Propagate the vehicle by exactly the time we granted cFS. The
-            // picture and the telemetry are then the same run -- if these two
-            // ever diverge, the display is lying about the flight software.
             let mut s = state.lock().unwrap();
-            s.vehicle.step(f64::from(TICK_USEC) / 1e6 * f64::from(n));
 
             // Sample the trail sparsely: a point per second of simulated time is
             // plenty for a smooth track, and keeps a 90-minute orbit cheap.
@@ -249,6 +269,10 @@ fn drain(sock: &UdpSocket, state: &mut State) {
         };
 
         let Ok(pkt) = TlmPacket::parse(&buf[..n]) else { continue };
+
+        if let Some(f) = FswState::parse(pkt.msg_id, &buf[..n]) {
+            state.fsw = Some(f);
+        }
 
         if let Some(ev) = evs::parse(pkt.msg_id, &buf[..n]) {
             state.events.push(ev);

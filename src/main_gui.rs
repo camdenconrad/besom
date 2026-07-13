@@ -6,6 +6,14 @@ use besom::gui::Besom;
 use besom::run::{self, Config};
 use besom::session::Session;
 
+/// The window/dock icon, rasterised from the SVG at build time.
+fn icon() -> egui::IconData {
+    let png = include_bytes!("../assets/besom-256.png");
+    let img = image::load_from_memory(png).expect("besom icon").into_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData { rgba: img.into_raw(), width, height }
+}
+
 fn main() -> eframe::Result {
     let cfg = Config {
         cfs_dir: run::default_cfs_dir(),
@@ -16,9 +24,13 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("besom")
-            .with_app_id("besom")
+            .with_app_id("besom") // Wayland app_id -> dock icon match
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_min_inner_size([900.0, 600.0])
+            .with_icon(icon())
+            // Rune advertises no server-side decorations, so under the `rune`
+            // feature we draw our own title bar. Elsewhere, keep the normal ones.
+            .with_decorations(cfg!(not(feature = "rune"))),
         ..Default::default()
     };
 

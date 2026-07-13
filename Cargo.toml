@@ -17,7 +17,10 @@ path = "src/lib.rs"
 # CI runs determinism checks with --no-default-features.
 [features]
 default = ["app"]
-app = ["dep:eframe", "dep:egui"]
+app = ["dep:eframe", "dep:egui", "dep:image"]
+# Rune-native window chrome: decorationless window with the autumn title bar.
+# Off by default so the app keeps normal decorations on any other desktop.
+rune = ["app"]
 
 # The ground station.
 [[bin]]
@@ -35,3 +38,4 @@ anyhow = "1"
 libc = "0.2"
 eframe = { version = "0.29.1", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"], optional = true }
 egui = { version = "0.29.1", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }

@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!--
+    besom — a witch's broom sweeping an orbit.
+
+    The idea: the broom's sweep IS the orbit track. The handle is the velocity
+    vector, the bristles are the trail behind the spacecraft, and the whole thing
+    is a body in orbit around a planet. One shape, two readings.
+  -->
+  <defs>
+    <radialGradient id="planet" cx="38%" cy="32%" r="72%">
+      <stop offset="0%" stop-color="#3d6c9e"/>
+      <stop offset="55%" stop-color="#22436b"/>
+      <stop offset="100%" stop-color="#122740"/>
+    </radialGradient>
+
+    <linearGradient id="sweep" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e99448" stop-opacity="0"/>
+      <stop offset="45%" stop-color="#e99448" stop-opacity="0.75"/>
+      <stop offset="100%" stop-color="#f8b06a" stop-opacity="1"/>
+    </linearGradient>
+
+    <linearGradient id="handle" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#8a5a34"/>
+      <stop offset="100%" stop-color="#d99a5e"/>
+    </linearGradient>
+
+    <linearGradient id="bristle" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#f0b46f"/>
+      <stop offset="100%" stop-color="#a9682e"/>
+    </linearGradient>
+
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- deep space -->
+  <rect width="512" height="512" rx="112" fill="#0e0f14"/>
+
+  <!-- a few stars, deliberately sparse: an icon is read at 32px -->
+  <g fill="#cfd6e4">
+    <circle cx="96" cy="86" r="2.6" opacity=".75"/>
+    <circle cx="420" cy="118" r="2.1" opacity=".55"/>
+    <circle cx="392" cy="404" r="2.4" opacity=".6"/>
+    <circle cx="122" cy="392" r="1.8" opacity=".45"/>
+  </g>
+
+  <!-- the planet -->
+  <circle cx="256" cy="300" r="132" fill="url(#planet)"/>
+  <!-- limb light: sells the sphere at small sizes -->
+  <path d="M 145 232 A 132 132 0 0 1 340 210" fill="none" stroke="#6fa8dc" stroke-opacity=".55" stroke-width="5" stroke-linecap="round"/>
+  <!-- equator, the same cue the orbit view uses -->
+  <ellipse cx="256" cy="300" rx="132" ry="34" fill="none" stroke="#5b8fc0" stroke-opacity=".3" stroke-width="4"/>
+
+  <!-- the orbit / the sweep of the broom: one arc, both meanings -->
+  <path d="M 78 330 C 96 176, 250 74, 404 128"
+        fill="none" stroke="url(#sweep)" stroke-width="15" stroke-linecap="round" filter="url(#glow)"/>
+
+  <!-- The broom, riding the arc, angled along the velocity vector.
+       Drawn BIG and chunky on purpose: an icon is read at 32px, where a delicate
+       fan of bristles collapses into a smudge. One wedge, one handle. -->
+  <g transform="translate(392 132) rotate(152)">
+    <!-- bristles: a solid wedge, splayed backward along the track -->
+    <path d="M 4 -14 L 104 -58 L 118 0 L 104 58 L 4 14 Z" fill="url(#bristle)"/>
+    <!-- two cuts, enough to say "bristles" without becoming noise -->
+    <path d="M 30 -8 L 110 -34" stroke="#7a4a22" stroke-width="4" stroke-opacity=".55" stroke-linecap="round"/>
+    <path d="M 30 8 L 110 34" stroke="#7a4a22" stroke-width="4" stroke-opacity=".55" stroke-linecap="round"/>
+    <!-- the binding -->
+    <rect x="-14" y="-17" width="22" height="34" rx="7" fill="#5d3a1e"/>
+    <!-- the handle: also the velocity vector -->
+    <rect x="-104" y="-9" width="98" height="18" rx="9" fill="url(#handle)"/>
+    <circle cx="-104" cy="0" r="11" fill="#f8b06a"/>
+  </g>
+</svg>

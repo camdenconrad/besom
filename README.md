@@ -14,6 +14,7 @@ and the vehicle stops in the sky at the exact instant the flight software stoppe
 besom          # ground station: orbit view, live telemetry, event log, commanding
 besomctl run   # boot cFS on the simulated clock, print a telemetry transcript
 besomctl check # run a scenario twice; fail if the packet stream differs
+besomctl loop  # feed vehicle state into cFS; fail if it reports anything stale
 ```
 
 ## Why
@@ -65,13 +66,43 @@ packet, a duplicate, a wrong size, a reordering, a wrong value — without asser
 scheduler. `Transcript::same_stream` does exactly this; `besomctl check` fails on a stream difference
 and merely *reports* placement jitter.
 
+## Closing the loop
+
+`besom_io` (in `cfs/`) is a cFS app that runs *inside* the flight executive. It receives simulated
+vehicle state from the harness and publishes it on the software bus, so flight apps consume
+spacecraft state over the interfaces they would really use — and the ground station reads state back
+that has travelled **through** cFS, not Besom's own copy of it.
+
+Two details keep it deterministic, and both are the difference between a sim and a toy:
+
+* It wakes on an OSAL timer bound to `cFS-Master` — the timebase Besom steps — so it runs on
+  simulated time.
+* It reads its socket **non-blocking**, and **drains to the newest sample**. Reading one datagram
+  per cycle while the harness sends one per tick consumes the queue slower than it fills: the
+  backlog grows without bound and the published state falls steadily further into the past. It
+  looks like a small plausible lag and is in fact unbounded drift. A sensor reports what is true
+  *now*.
+
+`besomctl loop` proves it: it feeds state in and fails if the flight software reports anything stale.
+
+```
+$ besomctl loop 600
+cFS accepted 590 state updates (0 malformed)
+worst disagreement: lat 0.000506deg  lon 0.000401deg
+closed loop verified: cFS reports exactly the state it was given
+```
+
 ## Running it
 
-You need a cFS build with the Besom PSP module. From a cFS bundle checkout:
+You need a cFS build carrying the Besom PSP module, the OSAL simulated-time changes, and the
+`besom_io` app. From a cFS bundle checkout:
 
 ```sh
+cp -r /path/to/besom/cfs/besom_io cFS/apps/besom_io
+
 git -C cFS/psp  apply /path/to/besom/patches/psp-timebase-besom.patch
 git -C cFS/osal apply /path/to/besom/patches/osal-simulated-time.patch
+git -C cFS      apply /path/to/besom/patches/cfs-mission-config.patch
 
 cd cFS
 CMAKE_POLICY_VERSION_MINIMUM=3.5 make native_std.install   # cmake ≥4 needs the policy shim
@@ -109,6 +140,7 @@ scene is a sphere, a trail and a few axes, and a second renderer would be cost w
 | `session` | a live, operator-driven run |
 | `run` | scripted scenarios |
 | `dynamics` | orbit + attitude propagation |
+| `fsw` | the link to `besom_io`, the sensor bridge inside cFS |
 | `view3d` / `gui` | the ground station |
 
 ## Status
@@ -117,8 +149,9 @@ A working harness and ground station, not a finished product. Known gaps, in the
 
 1. **Deterministic intra-tick scheduling** — the last thing between this and a byte-deterministic
    cFS.
-2. **Device simulation** behind the OSAL/PSP `iodriver` seam, so flight apps talk to simulated
-   sensors over the interfaces they would really use.
+2. **More device simulation.** `besom_io` proves the path; real sensors (star tracker, IMU, GPS)
+   belong behind the OSAL/PSP `iodriver` seam so flight apps talk to them over the buses they would
+   really use.
 3. **J2 and a real attitude model.**
 
 Licensed Apache-2.0, matching cFS.

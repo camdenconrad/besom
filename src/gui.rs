@@ -13,6 +13,9 @@ use eframe::egui;
 
 /// Well-known message ids, so the operator sees names rather than hex.
 fn stream_name(msg_id: u16) -> &'static str {
+    if msg_id == crate::fsw::STATE_TLM_MID {
+        return "BESOM_IO state";
+    }
     match msg_id {
         0x0800 => "cFE ES",
         0x0801 => "cFE EVS",
@@ -66,6 +69,9 @@ impl eframe::App for Besom {
         // Simulated time only moves when we grant it, but the *display* is still
         // a real-time view of a live process, so keep repainting.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
+        #[cfg(feature = "rune")]
+        crate::chrome::title_bar(ctx, "besom — cFS ground station");
 
         egui::TopBottomPanel::top("transport").show(ctx, |ui| self.transport(ui));
 
@@ -198,8 +204,68 @@ impl Besom {
 
         ui.add_space(8.0);
         ui.separator();
+        self.closed_loop(ui);
+        ui.separator();
         ui.add_space(4.0);
         self.command_builder(ui);
+    }
+
+    /// What the FLIGHT SOFTWARE thinks, beside what we sent it.
+    ///
+    /// The state on the left has travelled through cFS: Besom -> besom_io ->
+    /// software bus -> TO_LAB -> downlink -> here. If the two columns ever
+    /// disagree, the loop is broken -- and being able to SEE that is worth more
+    /// than either number alone.
+    fn closed_loop(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.strong("Closed loop");
+            ui.weak("state as reported BY the flight software");
+        });
+        ui.add_space(2.0);
+
+        let Some(f) = self.state.fsw else {
+            ui.weak("waiting for BESOM_IO telemetry…");
+            return;
+        };
+
+        let truth = &self.state.vehicle;
+        let (lat, lon) = truth.orbit.subpoint_deg();
+
+        egui::Grid::new("loop").num_columns(4).striped(true).show(ui, |ui| {
+            for h in ["", "flight software", "besom", "Δ"] {
+                ui.strong(h);
+            }
+            ui.end_row();
+
+            for (name, fsw_v, truth_v, unit) in [
+                ("Altitude", f.alt_km, truth.orbit.altitude_km(), "km"),
+                ("Latitude", f.lat_deg, lat, "°"),
+                ("Longitude", f.lon_deg, lon, "°"),
+            ] {
+                let delta = fsw_v - truth_v;
+                ui.label(name);
+                ui.monospace(format!("{fsw_v:9.3} {unit}"));
+                ui.monospace(format!("{truth_v:9.3} {unit}"));
+
+                // A non-zero delta is not noise -- both sides are the same f64.
+                // It means cFS is reporting stale state, i.e. it missed a tick.
+                if delta.abs() < 1e-9 {
+                    ui.colored_label(theme::GOOD, "0");
+                } else {
+                    ui.colored_label(theme::ACCENT, format!("{delta:+.3}"));
+                }
+                ui.end_row();
+            }
+        });
+
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.weak(format!("cFS accepted {} state updates", f.rx_count));
+            if f.rx_err_count > 0 {
+                ui.colored_label(theme::BAD, format!("{} malformed", f.rx_err_count));
+            }
+        });
     }
 
     fn command_builder(&mut self, ui: &mut egui::Ui) {

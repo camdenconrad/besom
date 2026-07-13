@@ -41,25 +41,36 @@ impl Camera {
     /// depth buffer, that occlusion test is the only thing keeping the far half
     /// of the orbit from drawing over the planet.
     fn project(&self, p: Vec3, rect: &Rect) -> (Pos2, f64) {
+        // A proper orthonormal camera basis, derived from the view direction.
+        //
+        // The earlier version rotated about the polar axis and then sheared,
+        // which is *nearly* right and feels wrong the moment you drag: the
+        // horizon tilts, and the axes stop agreeing with each other as elevation
+        // grows. Build the basis from the eye direction instead and the three
+        // vectors stay orthonormal at every angle.
         let (sa, ca) = (self.azimuth.sin(), self.azimuth.cos());
         let (se, ce) = (self.elevation.sin(), self.elevation.cos());
 
-        // Camera basis: right, up, forward (toward the viewer).
-        let x = p.x * ca + p.y * sa;
-        let y = -p.x * sa + p.y * ca;
+        // Eye direction: from the origin toward the camera.
+        let eye = Vec3::new(ce * ca, ce * sa, se);
+        // Right: horizontal, perpendicular to the eye. Never degenerates, because
+        // elevation is clamped away from the poles.
+        let right = Vec3::new(-sa, ca, 0.0);
+        // Up: completes a right-handed set. (eye × right, normalised by
+        // construction since both are unit and orthogonal.)
+        let up = eye.cross(right).scale(-1.0);
 
-        let right = x;
-        let up = p.z * ce - y * se;
-        let depth = y * ce + p.z * se; // +ve is toward the viewer
+        let dot = |a: Vec3, b: Vec3| a.x * b.x + a.y * b.y + a.z * b.z;
 
         let scale = rect.height() as f64 / self.span_km;
         let c = rect.center();
+
         (
             Pos2::new(
-                c.x + (right * scale) as f32,
-                c.y - (up * scale) as f32, // screen y grows downward
+                c.x + (dot(p, right) * scale) as f32,
+                c.y - (dot(p, up) * scale) as f32, // screen y grows downward
             ),
-            depth,
+            dot(p, eye), // +ve is toward the viewer
         )
     }
 
@@ -75,6 +86,10 @@ pub fn show(ui: &mut Ui, cam: &mut Camera, vehicle: &Vehicle, trail: &[Vec3]) ->
 
     // ---- camera control ----
     if response.dragged() {
+        // Drag-to-orbit: the point under the cursor should follow the cursor.
+        // Dragging right spins the globe right (azimuth decreases); dragging down
+        // tips the north pole toward you (elevation increases). Getting either
+        // sign backwards is what makes a camera feel "weird" rather than wrong.
         let d = response.drag_delta();
         cam.azimuth -= f64::from(d.x) * 0.006;
         cam.elevation = (cam.elevation + f64::from(d.y) * 0.006).clamp(-1.45, 1.45);
@@ -248,14 +263,51 @@ mod tests {
     fn depth_sign_distinguishes_near_from_far() {
         // The only thing preventing the far half of the orbit from painting over
         // the planet, so it is worth a test.
+        //
+        // At azimuth 0, elevation 0 the eye sits on +x looking back at the origin.
         let cam = Camera { azimuth: 0.0, elevation: 0.0, span_km: 20_000.0 };
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
 
-        let (_, near) = cam.project(Vec3::new(0.0, 8000.0, 0.0), &rect);
-        let (_, far) = cam.project(Vec3::new(0.0, -8000.0, 0.0), &rect);
+        let (_, near) = cam.project(Vec3::new(8000.0, 0.0, 0.0), &rect);
+        let (_, far) = cam.project(Vec3::new(-8000.0, 0.0, 0.0), &rect);
 
         assert!(near > 0.0, "toward the viewer");
         assert!(far < 0.0, "away from the viewer");
+    }
+
+    #[test]
+    fn the_camera_basis_stays_orthonormal_while_orbiting() {
+        // The bug the rewrite fixed: the old projection sheared instead of
+        // rotating, so the axes drifted out of square as elevation grew and the
+        // horizon visibly tilted while dragging. Probe the basis by projecting
+        // unit vectors -- a rigid camera preserves lengths and right angles at
+        // every angle.
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 600.0));
+
+        for (az, el) in [(0.0, 0.0), (0.9, 0.7), (2.4, -1.2), (5.0, 1.4)] {
+            let cam = Camera { azimuth: az, elevation: el, span_km: 600.0 }; // 1 km/px
+            let o = cam.project(Vec3::ZERO, &rect).0;
+
+            // Screen displacement of each world axis, in pixels.
+            let axes = [
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+            ]
+            .map(|a| {
+                let p = cam.project(a, &rect).0;
+                let d = cam.project(a, &rect).1;
+                ((p.x - o.x) as f64, (p.y - o.y) as f64, d)
+            });
+
+            // An orthonormal basis projected orthographically: each world unit
+            // vector's screen offset plus its depth must have unit length.
+            // Tolerance is set by f32 screen coordinates, not by the maths.
+            for (dx, dy, dz) in axes {
+                let len = (dx * dx + dy * dy + dz * dz).sqrt();
+                assert!((len - 1.0).abs() < 1e-3, "axis length {len} at ({az}, {el})");
+            }
+        }
     }
 
     #[test]

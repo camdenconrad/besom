@@ -1,6 +1,8 @@
 //! Driving a cFS instance: boot it, own its clock, capture its telemetry.
 
 use crate::ccsds::{build_command, TlmPacket};
+use crate::dynamics::Vehicle;
+use crate::fsw::{self, FswState};
 use crate::clock::{Clock, TICK_USEC};
 use crate::quiesce;
 use crate::transcript::Transcript;
@@ -130,14 +132,38 @@ impl Drop for Cfs {
     }
 }
 
+/// The worst disagreement seen between the flight software's reported state and
+/// the harness's own, over a run.
+///
+/// Both sides are the same f64 travelling over a lossless local link, so a
+/// non-zero worst-case is not numerical noise -- it means cFS was reporting
+/// STALE state, i.e. the sensor feed was falling behind the simulation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoopError {
+    pub max_lat_deg: f64,
+    pub max_lon_deg: f64,
+    pub samples: u32,
+    pub last: Option<FswState>,
+}
+
 /// Boot cFS, enable its downlink, step the clock, and record the telemetry.
 pub fn run(cfg: &Config) -> Result<Transcript> {
+    Ok(run_with_loop(cfg)?.0)
+}
+
+/// As [`run`], but also feeds simulated vehicle state to the `besom_io` app and
+/// measures how faithfully the flight software reports it back.
+pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     let cfs = Cfs::boot(cfg)?;
     let mut clock = Clock::connect(&cfg.step_sock)?;
 
     let tlm = UdpSocket::bind(("0.0.0.0", TLM_PORT))
         .with_context(|| format!("binding telemetry port {TLM_PORT}"))?;
     tlm.set_nonblocking(true)?;
+    let sensors = UdpSocket::bind(("0.0.0.0", 0))?;
+
+    let mut vehicle = Vehicle::default();
+    let mut loop_err = LoopError::default();
 
     // Enable the downlink BEFORE granting any time at all.
     //
@@ -165,14 +191,26 @@ pub fn run(cfg: &Config) -> Result<Transcript> {
         .context("TO_LAB never acknowledged the enable command")?;
     quiesce::wait(cfs.pid());
 
+    // Subscribe besom_io's telemetry: TO_LAB's table is baked in at build time.
+    let up = UdpSocket::bind(("0.0.0.0", 0))?;
+    up.send_to(&fsw::add_packet_command(fsw::STATE_TLM_MID), ("127.0.0.1", CI_PORT))?;
+    quiesce::wait(cfs.pid());
+
     // Anything emitted while enabling is boot history; the run starts at tick 1.
     drain(&tlm, &mut Transcript::new());
 
     let mut transcript = Transcript::new();
     for _ in 0..cfg.ticks {
+        // Deliver sensor data BEFORE granting the tick that lets the flight
+        // software look for it.
+        let _ = sensors.send_to(&fsw::encode_state(&vehicle), ("127.0.0.1", fsw::STATE_PORT));
+
         clock.step(TICK_USEC)?;
         quiesce::wait(cfs.pid());
-        drain(&tlm, &mut transcript);
+
+        drain_with_loop(&tlm, &mut transcript, &vehicle, &mut loop_err);
+
+        vehicle.step(f64::from(TICK_USEC) / 1e6);
     }
 
     // A packet emitted on the very last tick can still be in flight -- TO_LAB's
@@ -186,7 +224,38 @@ pub fn run(cfg: &Config) -> Result<Transcript> {
         idle = if drain(&tlm, &mut transcript) > 0 { 0 } else { idle + 1 };
     }
 
-    Ok(transcript.finish())
+    Ok((transcript.finish(), loop_err))
+}
+
+/// Drain, and where a besom_io state packet appears, compare what the flight
+/// software reported against what we actually sent it.
+fn drain_with_loop(
+    sock: &UdpSocket,
+    transcript: &mut Transcript,
+    vehicle: &Vehicle,
+    err: &mut LoopError,
+) {
+    let mut buf = [0u8; 65535];
+
+    loop {
+        let n = match sock.recv_from(&mut buf) {
+            Ok((n, _)) => n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        };
+
+        let Ok(pkt) = TlmPacket::parse(&buf[..n]) else { continue };
+
+        if let Some(f) = FswState::parse(pkt.msg_id, &buf[..n]) {
+            let (lat, lon) = vehicle.orbit.subpoint_deg();
+            err.max_lat_deg = err.max_lat_deg.max((f.lat_deg - lat).abs());
+            err.max_lon_deg = err.max_lon_deg.max((f.lon_deg - lon).abs());
+            err.samples += 1;
+            err.last = Some(f);
+        }
+
+        transcript.record(&pkt);
+    }
 }
 
 fn drain(sock: &UdpSocket, transcript: &mut Transcript) -> usize {

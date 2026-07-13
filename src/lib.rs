@@ -23,11 +23,14 @@ pub mod ccsds;
 pub mod clock;
 pub mod dynamics;
 pub mod evs;
+pub mod fsw;
 pub mod quiesce;
 pub mod run;
 pub mod session;
 pub mod transcript;
 
+#[cfg(feature = "rune")]
+pub mod chrome;
 #[cfg(feature = "app")]
 pub mod gui;
 #[cfg(feature = "app")]

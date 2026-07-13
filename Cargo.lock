@@ -134,6 +134,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "image",
  "libc",
 ]
 

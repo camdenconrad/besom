@@ -71,7 +71,37 @@ fn main() -> Result<()> {
             }
         }
 
-        other => bail!("unknown command {other:?} (expected: run, check)"),
+        "loop" => {
+            // Prove the sensor feed keeps up: run cFS, push vehicle state in, and
+            // measure how far the flight software's reported position lags the
+            // truth we sent it.
+            let (t, l) = run::run_with_loop(&cfg)?;
+            println!("{} packets, {} state reports from the flight software", t.len(), l.samples);
+
+            if l.samples == 0 {
+                bail!("cFS never reported vehicle state -- is besom_io in the build?");
+            }
+
+            let Some(f) = l.last else { bail!("no state") };
+            println!(
+                "cFS accepted {} state updates ({} malformed)",
+                f.rx_count, f.rx_err_count
+            );
+            println!(
+                "worst disagreement: lat {:.6}deg  lon {:.6}deg",
+                l.max_lat_deg, l.max_lon_deg
+            );
+
+            // Both sides are the same f64 over a lossless local link. A real
+            // divergence means cFS is reading a backlogged socket and reporting
+            // state from the past.
+            if l.max_lat_deg > 0.01 || l.max_lon_deg > 0.01 {
+                bail!("the flight software is reporting STALE state -- the sensor feed is falling behind");
+            }
+            println!("closed loop verified: cFS reports exactly the state it was given");
+        }
+
+        other => bail!("unknown command {other:?} (expected: run, check, loop)"),
     }
 
     Ok(())

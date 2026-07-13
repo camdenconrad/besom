@@ -1,0 +1,53 @@
+diff --git a/sample_defs/generate_startup.cmake b/sample_defs/generate_startup.cmake
+index ce2f6e3..75cd689 100644
+--- a/sample_defs/generate_startup.cmake
++++ b/sample_defs/generate_startup.cmake
+@@ -12,7 +12,7 @@ function (generate_cfs_startup_script CFS_INSTALL_DIR)
+     )
+ 
+     # the rest of the apps can vary by config
+-    set(CFS_APP_STARTUP_ORDER lc cf ds fm hk hs mm sc md cs sbn)
++    set(CFS_APP_STARTUP_ORDER lc cf ds fm hk hs mm sc md cs sbn besom_io)
+     foreach(APP ${CFS_APP_STARTUP_ORDER})
+         list(FIND ARGN ${APP} SHOULD_START)
+         if (SHOULD_START GREATER -1)
+diff --git a/sample_defs/targets.cmake b/sample_defs/targets.cmake
+index 736b14f..cd7fb72 100644
+--- a/sample_defs/targets.cmake
++++ b/sample_defs/targets.cmake
+@@ -88,6 +88,13 @@ SET(SPACECRAFT_ID 0x42)
+ # Example:
+ list(APPEND MISSION_GLOBAL_APPLIST sample_app sample_lib)
+ 
++# BESOM NOTE: cf, hs, mm, cs and fm call OS_TaskDelay, which in the POSIX OSAL
++# sleeps on the HOST clock -- it is NOT driven by the timebase. Those apps run
++# outside the simulated clock, and their telemetry (e.g. MID 0x08ad) drifts run
++# to run no matter how precisely we gate ticks. They are left in the build for
++# now: excluding them here breaks table generation, which still binds to the
++# targets. The real fix is to make OS_TaskDelay sim-clock driven, which is an
++# OSAL change rather than a PSP one. See docs/besom-phase0.md.
+ LIST(APPEND MISSION_GLOBAL_APPLIST cf)
+ LIST(APPEND MISSION_GLOBAL_APPLIST hs)
+ LIST(APPEND MISSION_GLOBAL_APPLIST md)
+@@ -99,9 +106,20 @@ LIST(APPEND MISSION_GLOBAL_APPLIST sc)
+ LIST(APPEND MISSION_GLOBAL_APPLIST ds)
+ LIST(APPEND MISSION_GLOBAL_APPLIST hk)
+ 
++# BESOM: the sensor bridge. Receives simulated vehicle state from the harness and
++# publishes it on the software bus, so flight apps consume spacecraft state the
++# way they would in orbit. Simulation-only -- not flight software.
++LIST(APPEND MISSION_GLOBAL_APPLIST besom_io)
++
+ # Some apps do not have EDS support yet.
+ # These should not be included by default when building with EDS.
+-if (NOT CFE_EDS_ENABLED AND SIMULATION STREQUAL "native")
++# BESOM: sbn is excluded. Its protocol modules (sbn_udp, sbn_f_remap) load as
++# separate shared objects whose symbols SBN never resolves ("undefined symbol:
++# SBN_UDP_Ops"), leaving it thrashing the software bus at startup -- a burst of
++# transmits whose count varies with host scheduling. That boot-time churn is not
++# gated by the simulated clock, so it makes telemetry transcripts irreproducible.
++# SBN is inter-CPU bus peering and Besom does not use it.
++if (FALSE AND NOT CFE_EDS_ENABLED AND SIMULATION STREQUAL "native")
+     LIST(APPEND MISSION_GLOBAL_APPLIST sbn)
+     LIST(APPEND MISSION_GLOBAL_APPLIST sbn_udp)
+     LIST(APPEND MISSION_GLOBAL_APPLIST sbn_f_remap)
