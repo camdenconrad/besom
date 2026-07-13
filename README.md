@@ -52,18 +52,34 @@ gate ticks. Same for the timed semaphore waits. See `patches/osal-simulated-time
 
 Measured over 30 s of simulated time, 87 packets, the full cFS app set:
 
-- **The packet stream is exactly reproducible.** Per message: the same count, the same CCSDS
-  sequence deltas, the same lengths. Nothing dropped, duplicated, reordered, or invented.
-  Verified 13/13 across 6 s, 30 s and 60 s scenarios.
-- **Tick placement jitters.** A minority of packets land a tick or two early or late.
+**Runs are byte-identical.** Same packets, same order, same lengths, same sequence deltas — and
+every packet on the *same tick*. Verified 11/11 across 6 s, 30 s and 60 s scenarios.
 
-The window is **phase-aligned at both ends**, and this is what makes it reliable. Guarding only the
-end is not enough — the *start* is the half that moves. cFE TIME's 1 Hz tone is armed during un-gated
-boot, so the system's phase at tick 1 is host-dependent, and a fixed tick budget then catches N or
-N+1 housekeeping cycles. So the harness does not start counting at tick 1: it steps until the system
-reaches a known point in its cycle (the first cFE ES housekeeping packet), starts the window there,
-and stops recording a guard band before it stops granting time. Both ends are then pinned to the
-same phase and the number of cycles inside is fixed.
+Four things are load-bearing, and each was a separate bug:
+
+**Cooperative scheduling** (`$BESOM_COOP`, on by default). Only one OSAL task runs at a time, and the
+token passes to the lowest-numbered *ready* task, keyed by OSAL task id — creation order, fixed by the
+startup script. Crucially, **readiness is set by the waker**: semaphores and queues never pend in the
+kernel, they poll and park on a coop channel, and the task performing the give/put marks the receiver
+ready *at that instant, while holding the token*. Timer callbacks give semaphores, so this is the path
+by which a tick makes tasks runnable. Anything that pends on the *host* (sockets, real sleeps, the
+harness itself) leaves the ready set entirely.
+
+**Step through boot.** An app that sleeps in its loop (cFS's HS does) takes its cycle phase from
+whichever clock is running. Wait idle for cFS to boot and those sleeps run on the *host* clock, so
+where the app's cycle lands when ticks begin depends on how fast the machine booted — HS's entire
+stream shifted by exactly one of its own periods. Grant ticks from the first instant instead.
+
+**A fixed boot budget.** Stepping *until the log says OPERATIONAL* is a host-timed condition: a
+slower boot consumes more ticks and every app's sub-phase moves with it. The harness grants a fixed
+number of boot ticks (padding past OPERATIONAL), so the phase is identical every run.
+
+**Phase-align the recorded window.** Don't start counting at tick 1 — step until the system reaches
+a known point in its cycle (the first cFE ES housekeeping packet), open the window there, and stop
+recording a guard band before you stop granting time. Both ends pinned to the same phase.
+
+Set `BESOM_COOP=0` to fall back to host scheduling: faster, but then only the *stream* is guaranteed,
+not tick placement.
 
 Within a single granted tick, cFE's tasks are *simultaneous* in simulated time — and the **host**
 scheduler decides which of them actually runs first. So *what* the flight software does is
@@ -134,52 +150,31 @@ cargo run --release --bin besom            # the ground station
 Without `$BESOM_STEP_SOCK` set, `timebase_besom` free-runs exactly like stock `soft_timebase`, so a
 patched PSP stays usable for ordinary (non-simulated) runs.
 
-## Intra-tick determinism: two things that don't work
+## Intra-tick determinism: how it was actually solved
 
-Recorded because both are the obvious ideas, and both are dead ends.
+Two dead ends first, recorded because both are the obvious ideas:
 
 **Pinning cFS to a single CPU does not help.** If the tasks cannot run simultaneously, surely the
 kernel must order them? Measured: placement jitter got *worse*. The quiescence poller ends up
 contending with cFS for the same core.
 
-**A cooperative token scheduler is not sufficient either — and the fix for *that* deadlocks.**
-`$BESOM_COOP=1` enables one in OSAL (shipped, off by default). Two rounds:
+**A cooperative token scheduler alone is not sufficient.** Ordering only the tasks *already waiting*
+for the token leaves the race intact: when a tick wakes several tasks, each becomes a waiter whenever
+its thread happens to get scheduled off its semaphore, so a fast-waking high-numbered task can take
+the token before a low-numbered one has even arrived to ask for it. Readiness must be established by
+the **waker**, synchronously — which is what the shipped scheduler does.
 
-*Round one — asynchronous readiness.* Only one task runs at a time; the token passes to the
-lowest-numbered *waiting* task, with keys from OSAL task ids (creation order, fixed by the startup
-script). It boots and does not deadlock, but it does not make runs deterministic:
+Two bugs found while getting there, both worth knowing:
 
-> The token only orders the tasks **already waiting for it**. When a tick wakes several tasks, each
-> becomes a waiter whenever its thread happens to get scheduled off its semaphore — so a
-> high-numbered task that wakes fast can take the token before a low-numbered task has even arrived
-> to ask for it. **Readiness is still observed asynchronously.** The race moved; it did not go away.
+*cFE's main thread is not an OSAL task*, so it never joins the scheduler. It was entering the
+cooperative paths, where `Block` is a no-op, and spinning forever instead of pending. The coop path
+must be gated on "this thread is in the schedule", not "the scheduler exists".
 
-*Round two — synchronous readiness.* The blocking primitives were reimplemented **on top of** the
-scheduler: semaphores and queues never pend in the kernel, they poll and park on a coop channel, and
-the task performing the `give`/`put` marks the receiver ready **at that instant, while holding the
-token**. Timer callbacks give semaphores, so this is the path by which a tick makes tasks runnable.
-Task delays sleep on the schedule and are expired by the tick thread.
-
-This is, I believe, the right design. **It deadlocks during boot**, and the diagnostic says exactly
-why:
-
-```
-COOP-STALL: key=65539 waiting. running=1 holder=65538
-   task key=0     ready=0 chan=(nil) ext=1     <- tick thread, pending on the harness
-   task key=65537 ready=1 chan=(nil) ext=0     <- runnable, cannot run
-   task key=65538 ready=1 chan=(nil) ext=0     <- HOLDS THE TOKEN, and is itself blocked
-   task key=65539 ready=1 chan=(nil) ext=0     <- runnable, cannot run
-```
-
-A task **holds the token and then blocks on something that is not a coop channel** — one of OSAL's
-own internal mutexes. Its owner has meanwhile parked on a coop channel, giving up the token but not
-the mutex. Synchronous readiness does not help, because the stall is in OSAL's *locking*, one layer
-below the scheduler.
-
-So the remaining work is not "wake tasks in order" — that part is done. It is to integrate the token
-with OSAL's internal locking, so that no task can hold the token across an internal lock that
-another task may hold across a block. That is the honest next step, and it is a bigger change than
-it sounds.
+*Any wait that blocks on the host must leave the ready set.* The timed-wait fallbacks were gated on
+simulated time being active — but during boot no ticks have been granted yet, so they fell through to
+the host path **while holding the token**. cFS's ES background task waits there for 999 ms at a time,
+which deadlocked boot outright: it held the token while every other task sat in `TakeToken`. gdb said
+so in one stack.
 
 ## The dynamics
 

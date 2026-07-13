@@ -1,5 +1,5 @@
 diff --git a/src/os/posix/src/os-impl-binsem.c b/src/os/posix/src/os-impl-binsem.c
-index 996f61c2..fdbfe706 100644
+index 996f61c2..ba7257f3 100644
 --- a/src/os/posix/src/os-impl-binsem.c
 +++ b/src/os/posix/src/os-impl-binsem.c
 @@ -31,6 +31,7 @@
@@ -30,10 +30,11 @@ index 996f61c2..fdbfe706 100644
      return OS_SUCCESS;
  }
  
-@@ -445,6 +452,35 @@ static int32 OS_GenericBinSemTake_Impl(const OS_object_token_t *token, const str
+@@ -445,7 +452,42 @@ static int32 OS_GenericBinSemTake_Impl(const OS_object_token_t *token, const str
   *-----------------------------------------------------------------*/
  int32 OS_BinSemTake_Impl(const OS_object_token_t *token)
  {
+-    return (OS_GenericBinSemTake_Impl(token, NULL));
 +    OS_impl_binsem_internal_record_t *sem;
 +    struct timespec                   now;
 +    int32                             status;
@@ -63,10 +64,17 @@ index 996f61c2..fdbfe706 100644
 +        }
 +    }
 +
-     return (OS_GenericBinSemTake_Impl(token, NULL));
++    /*
++     * Host fallback (coop off, or not a scheduled task): this blocks in the
++     * kernel, so it must NOT hold the token. See OS_COOP_EXTERNAL.
++     */
++    OS_COOP_EXTERNAL(status = OS_GenericBinSemTake_Impl(token, NULL));
++
++    return status;
  }
  
-@@ -458,6 +494,44 @@ int32 OS_BinSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
+ /*----------------------------------------------------------------
+@@ -458,12 +500,63 @@ int32 OS_BinSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
  {
      struct timespec ts;
  
@@ -111,8 +119,28 @@ index 996f61c2..fdbfe706 100644
      /*
       ** Compute an absolute time for the delay
       */
+     OS_Posix_CompAbsDelayTime(msecs, &ts);
+ 
+-    return (OS_GenericBinSemTake_Impl(token, &ts));
++    /*
++     * Host fallback -- reached during BOOT, before any tick has been granted, so
++     * simulated time is not yet active. It blocks in the kernel for up to `msecs`,
++     * and holding the token across that stalls every other task. cFS's ES
++     * background task waits here for 999 ms at a time, which is precisely what
++     * deadlocked boot: it held the token while everyone else sat in TakeToken.
++     */
++    {
++        int32 status;
++
++        OS_COOP_EXTERNAL(status = OS_GenericBinSemTake_Impl(token, &ts));
++
++        return status;
++    }
+ }
+ 
+ /*----------------------------------------------------------------
 diff --git a/src/os/posix/src/os-impl-countsem.c b/src/os/posix/src/os-impl-countsem.c
-index dfa8770e..42b3734c 100644
+index dfa8770e..304f8233 100644
 --- a/src/os/posix/src/os-impl-countsem.c
 +++ b/src/os/posix/src/os-impl-countsem.c
 @@ -31,6 +31,7 @@
@@ -141,10 +169,11 @@ index dfa8770e..42b3734c 100644
      return OS_SUCCESS;
  }
  
-@@ -142,6 +154,28 @@ int32 OS_CountSemTake_Impl(const OS_object_token_t *token)
+@@ -142,9 +154,38 @@ int32 OS_CountSemTake_Impl(const OS_object_token_t *token)
  
      impl = OS_OBJECT_TABLE_GET(OS_impl_count_sem_table, *token);
  
+-    if (sem_wait(&impl->id) < 0)
 +    /*
 +     * Under the cooperative scheduler we must never block in the kernel: doing so
 +     * would take this thread out of the scheduler's sight, and its wakeup order
@@ -152,7 +181,8 @@ index dfa8770e..42b3734c 100644
 +     * -- from which only a giver can release us.
 +     */
 +    if (OS_Coop_InSched_Impl())
-+    {
+     {
+-        return OS_SEM_FAILURE;
 +        for (;;)
 +        {
 +            if (sem_trywait(&impl->id) == 0)
@@ -167,10 +197,20 @@ index dfa8770e..42b3734c 100644
 +        }
 +    }
 +
-     if (sem_wait(&impl->id) < 0)
-     {
-         return OS_SEM_FAILURE;
-@@ -164,6 +198,47 @@ int32 OS_CountSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
++    /* Host fallback: blocks in the kernel, so it must not hold the token. */
++    {
++        int rc;
++
++        OS_COOP_EXTERNAL(rc = sem_wait(&impl->id));
++
++        if (rc < 0)
++        {
++            return OS_SEM_FAILURE;
++        }
+     }
+ 
+     return OS_SUCCESS;
+@@ -164,12 +205,56 @@ int32 OS_CountSemTimedWait_Impl(const OS_object_token_t *token, uint32 msecs)
  
      impl = OS_OBJECT_TABLE_GET(OS_impl_count_sem_table, *token);
  
@@ -218,8 +258,18 @@ index dfa8770e..42b3734c 100644
      /*
       ** Compute an absolute time for the delay
       */
+     OS_Posix_CompAbsDelayTime(msecs, &ts);
+ 
+-    if (sem_timedwait(&impl->id, &ts) == 0)
++    /* Host fallback: blocks in the kernel, so it must not hold the token. */
++    OS_COOP_EXTERNAL(result = (sem_timedwait(&impl->id, &ts) == 0) ? OS_SUCCESS : OS_ERROR);
++
++    if (result == OS_SUCCESS)
+     {
+         result = OS_SUCCESS;
+     }
 diff --git a/src/os/posix/src/os-impl-queues.c b/src/os/posix/src/os-impl-queues.c
-index 562abebb..43028966 100644
+index 562abebb..d141d12b 100644
 --- a/src/os/posix/src/os-impl-queues.c
 +++ b/src/os/posix/src/os-impl-queues.c
 @@ -33,6 +33,7 @@
@@ -230,7 +280,7 @@ index 562abebb..43028966 100644
  
  /* Tables where the OS object information is stored */
  OS_impl_queue_internal_record_t OS_impl_queue_table[OS_MAX_QUEUES];
-@@ -198,7 +199,35 @@ int32 OS_QueueGet_Impl(const OS_object_token_t *token, void *data, size_t size,
+@@ -198,16 +199,47 @@ int32 OS_QueueGet_Impl(const OS_object_token_t *token, void *data, size_t size,
       ** Read the message queue for data
       */
      sizeCopied = -1;
@@ -267,7 +317,19 @@ index 562abebb..43028966 100644
      {
          /*
           ** A signal can interrupt the mq_receive call, so the call has to be done with
-@@ -222,21 +251,74 @@ int32 OS_QueueGet_Impl(const OS_object_token_t *token, void *data, size_t size,
+          ** a loop
+          */
++        /* Host fallback: blocks in the kernel, so it must not hold the token. */
++        OS_Coop_ExternalBegin_Impl();
+         do
+         {
+             sizeCopied = mq_receive(impl->id, data, size, NULL);
+         } while (sizeCopied < 0 && errno == EINTR);
++        OS_Coop_ExternalEnd_Impl();
+     }
+     else
+     {
+@@ -222,21 +254,78 @@ int32 OS_QueueGet_Impl(const OS_object_token_t *token, void *data, size_t size,
           */
          if (timeout == OS_CHECK)
          {
@@ -342,16 +404,20 @@ index 562abebb..43028966 100644
 +            /*
 +             ** If the mq_timedreceive call is interrupted by a system call or signal,
 +             ** call it again.
++             **
++             ** Host fallback: blocks in the kernel, so it must not hold the token.
 +             */
++            OS_Coop_ExternalBegin_Impl();
 +            do
 +            {
 +                sizeCopied = mq_timedreceive(impl->id, data, size, NULL, &ts);
 +            } while (sizeCopied < 0 && errno == EINTR);
++            OS_Coop_ExternalEnd_Impl();
 +        }
  
      } /* END timeout */
  
-@@ -319,5 +401,12 @@ int32 OS_QueuePut_Impl(const OS_object_token_t *token, const void *data, size_t
+@@ -319,5 +408,12 @@ int32 OS_QueuePut_Impl(const OS_object_token_t *token, const void *data, size_t
          return_code = OS_ERROR;
      }
  

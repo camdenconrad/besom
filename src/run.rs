@@ -52,6 +52,14 @@ impl Cfs {
         let mut cmd = Command::new("./core-cpu1");
         cmd.current_dir(&cfg.cfs_dir)
             .env("BESOM_STEP_SOCK", &cfg.step_sock)
+            // Cooperative deterministic scheduling is ON by default: it is what
+            // makes tick placement reproducible, not just the packet stream. Set
+            // BESOM_COOP=0 to fall back to host scheduling (faster, but only the
+            // stream is then guaranteed).
+            .env(
+                "BESOM_COOP",
+                std::env::var("BESOM_COOP").unwrap_or_else(|_| "1".into()),
+            )
             .stdout(Stdio::from(std::fs::File::create(&log)?))
             .stderr(Stdio::from(std::fs::File::create(&log)?));
 
@@ -85,17 +93,18 @@ impl Cfs {
         this.await_deadline(Duration::from_secs(10), || cfg.step_sock.exists())
             .context("PSP never bound the step socket (is timebase_besom in the build?)")?;
 
-        // Wait for cFE to declare the system OPERATIONAL -- that is the barrier
-        // at which every app has been loaded and initialised, and therefore has
-        // ARMED ITS TIMERS. Any app that arms a timer after we start stepping
-        // gets a phase that depends on how many ticks we had already granted,
-        // which shows up as an entire telemetry stream sliding between runs.
+        // NOTE: we do NOT wait for the apps here.
         //
-        // "CI_LAB listening" is NOT that barrier: apps initialise concurrently
-        // and several (hs, cs, cf, besom_io...) start later in the startup script.
-        this.await_log("CI_LAB listening", Duration::from_secs(20))
-            .context("cFS never reached OPERATIONAL")?;
-        sleep(Duration::from_millis(500)); // let the last inits settle
+        // The caller must GRANT TICKS WHILE cFS BOOTS. An app that sleeps in its
+        // loop (cFS's HS does) takes its cycle phase from whatever clock is
+        // running: if simulated time is not yet active, those sleeps run on the
+        // HOST clock, and where the app's cycle lands when ticks finally begin
+        // depends on how fast the machine happened to boot. That showed up as HS's
+        // entire telemetry stream shifting by exactly one of its own periods
+        // between runs.
+        //
+        // Stepping from the first instant makes every app's timing simulated, so
+        // its phase is ours.
 
         Ok(this)
     }
@@ -172,19 +181,50 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     let mut vehicle = Vehicle::default();
     let mut loop_err = LoopError::default();
 
-    // Enable the downlink BEFORE granting any time at all.
+    // STEP THROUGH BOOT.
     //
-    // Two things depend on this ordering:
+    // Grant ticks while cFS starts up, so that simulated time is running from its
+    // first instant and every app's cycle phase is set by OUR clock rather than by
+    // how fast the host happened to boot.
+    // The boot must consume a FIXED number of ticks, not "however many it takes".
     //
-    //  - The clock is frozen at zero, so the command takes effect at an exact
-    //    simulated instant. Sending it while stepping means CI_LAB picks it up
-    //    at a host-scheduling-dependent moment and the run stops being
-    //    reproducible.
+    // Stepping until the log says OPERATIONAL is a HOST-timed condition: a slower
+    // boot consumes more ticks, and every app's cycle phase moves with it. That
+    // leaves a residual sub-phase error -- one run in nine came out shifted by 10
+    // ticks, which is exactly besom_io's 10 Hz period.
     //
-    //  - The capture window opens at sim-time zero, so every packet the run ever
-    //    emits is recorded. Warming up with ticks first leaves a variable amount
-    //    of un-captured history behind the first observed packet, which surfaces
-    //    as drifting sequence counters and looks like a clock bug.
+    // So step a fixed budget: enough for any boot, and identical every run.
+    const BOOT_TICKS: u32 = 4000;
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut booted = false;
+
+        for _i in 0..BOOT_TICKS {
+            clock.step(TICK_USEC)?;
+            quiesce::wait(cfs.pid());
+
+            if !booted && cfs.log_contains("entering OPERATIONAL state") {
+                booted = true;
+                if std::env::var("BESOM_DEBUG").is_ok() {
+                    eprintln!("  (boot: OPERATIONAL after {_i} ticks)");
+                }
+            }
+            if Instant::now() > deadline {
+                bail!("cFS boot timed out");
+            }
+        }
+
+        if !booted {
+            bail!("cFS never reached OPERATIONAL within {BOOT_TICKS} ticks");
+        }
+        if std::env::var("BESOM_DEBUG").is_ok() {
+            eprintln!("  (boot: OPERATIONAL reached, padded to {BOOT_TICKS} ticks)");
+        }
+    }
+
+    // Enable the downlink -- with the clock frozen, so it takes effect at an exact
+    // simulated instant. Sending it while stepping means CI_LAB picks it up at a
+    // host-scheduling-dependent moment and the run stops being reproducible.
     //
     // The command path itself needs no ticks: CI_LAB reads its socket on an
     // ordinary host task.
