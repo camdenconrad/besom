@@ -150,6 +150,22 @@ cargo run --release --bin besom            # the ground station
 Without `$BESOM_STEP_SOCK` set, `timebase_besom` free-runs exactly like stock `soft_timebase`, so a
 patched PSP stays usable for ordinary (non-simulated) runs.
 
+### Bringing up the downlink
+
+TO_LAB boots *awaiting an enable command*: it downlinks nothing until the ground station tells it
+where to send. That command goes out over UDP, and one more bug is worth knowing.
+
+**Do not uplink before CI_LAB has bound its port.** `Cfs::boot` returns as soon as the PSP binds the
+step socket — deliberately, because the caller must grant ticks *while* cFS boots. CI_LAB binds UDP
+1234 some time after that. A command sent into the gap is a datagram to a closed port: dropped, in
+silence. TO_LAB then sits at "Awaiting enable command" forever, no telemetry is ever downlinked, and
+cFS, the timebase and the tick stream all look perfectly healthy — the ground station simply shows an
+empty sky. Wait for the bind, resend until TO_LAB acknowledges with `TO_LAB_TLMOUTENA_INF_EID`, and
+fail loudly rather than fly blind.
+
+Waiting on the wrong event hides this rather than catching it: `TO_LAB 19` (*subscribed to the table*)
+is a **boot** event and fires whether or not the enable ever arrived.
+
 ## Intra-tick determinism: how it was actually solved
 
 Two dead ends first, recorded because both are the obvious ideas:
