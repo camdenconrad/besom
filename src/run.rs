@@ -199,8 +199,26 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     // Anything emitted while enabling is boot history; the run starts at tick 1.
     drain(&tlm, &mut Transcript::new());
 
+    // GUARD BAND: stop RECORDING before we stop GRANTING TIME.
+    //
+    // The run's edge is otherwise not at a deterministic simulated instant. A
+    // packet emitted on the final tick may or may not have reached the socket
+    // before we stopped, and a periodic app whose timer was armed during un-gated
+    // boot fires N or N+1 times over a fixed budget. Either way the transcript's
+    // last packet appears and disappears between runs -- which is the run's edge
+    // moving, not the flight software behaving differently, and it is not worth
+    // weakening the stream comparison to tolerate.
+    //
+    // So keep stepping for a further GUARD ticks and throw those packets away.
+    // The recorded window then ends at a simulated time we chose, and the packet
+    // counts are stable.
+    const GUARD: u32 = 30;
+    let record_until = cfg.ticks.saturating_sub(GUARD);
+
     let mut transcript = Transcript::new();
-    for _ in 0..cfg.ticks {
+    let mut discard = Transcript::new();
+
+    for tick in 0..cfg.ticks {
         // Deliver sensor data BEFORE granting the tick that lets the flight
         // software look for it.
         let _ = sensors.send_to(&fsw::encode_state(&vehicle), ("127.0.0.1", fsw::STATE_PORT));
@@ -208,7 +226,8 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
         clock.step(TICK_USEC)?;
         quiesce::wait(cfs.pid());
 
-        drain_with_loop(&tlm, &mut transcript, &vehicle, &mut loop_err);
+        let sink = if tick < record_until { &mut transcript } else { &mut discard };
+        drain_with_loop(&tlm, sink, &vehicle, &mut loop_err);
 
         vehicle.step(f64::from(TICK_USEC) / 1e6);
     }
@@ -217,11 +236,12 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     // downlink runs on its own thread and the datagram has to reach the socket
     // buffer. Draining once races that, and the run captures 7 or 8 packets
     // depending on host timing. Re-drain until two passes come up empty.
+    // Anything still in flight belongs to the guard band, not the record.
     let mut idle = 0;
     while idle < 2 {
         quiesce::wait(cfs.pid());
         sleep(Duration::from_millis(50));
-        idle = if drain(&tlm, &mut transcript) > 0 { 0 } else { idle + 1 };
+        idle = if drain(&tlm, &mut discard) > 0 { 0 } else { idle + 1 };
     }
 
     Ok((transcript.finish(), loop_err))

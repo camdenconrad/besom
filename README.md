@@ -61,6 +61,12 @@ scheduler decides which of them actually runs first. So *what* the flight softwa
 deterministic; *when* it does it is not, for a minority of packets. Closing that gap needs a
 cooperative scheduler inside OSAL, not a better clock.
 
+The run's *edge* is handled at source rather than tolerated: the harness stops **recording** a guard
+band of ticks before it stops **granting time**. Otherwise a packet emitted on the final tick may or
+may not have reached the socket, and a periodic app whose timer was armed during un-gated boot fires
+N or N+1 times over a fixed budget — the transcript's last packet then appears and disappears between
+runs, which is the run's edge moving, not the software behaving differently.
+
 **So assert on the stream, never on tick placement.** That catches every real defect — a dropped
 packet, a duplicate, a wrong size, a reordering, a wrong value — without asserting on Linux's
 scheduler. `Transcript::same_stream` does exactly this; `besomctl check` fails on a stream difference
@@ -148,7 +154,9 @@ scene is a sphere, a trail and a few axes, and a second renderer would be cost w
 A working harness and ground station, not a finished product. Known gaps, in the order they matter:
 
 1. **Deterministic intra-tick scheduling** — the last thing between this and a byte-deterministic
-   cFS.
+   cFS. (Pinning cFS to a single CPU does *not* achieve it — measured, and it made placement worse.
+   It needs cooperative scheduling inside OSAL, so that only one task runs at a time in a defined
+   order.)
 2. **More device simulation.** `besom_io` proves the path; real sensors (star tracker, IMU, GPS)
    belong behind the OSAL/PSP `iodriver` seam so flight apps talk to them over the buses they would
    really use.

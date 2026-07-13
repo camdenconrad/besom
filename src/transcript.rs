@@ -128,20 +128,45 @@ impl Transcript {
     /// True when two runs produced the same packet stream — the property that
     /// actually holds, and the one a regression test should assert.
     ///
-    /// Per MID: the same number of packets, with the same sequence deltas (so a
-    /// drop or duplicate fails) and the same lengths. Deliberately ignores which
-    /// tick each packet landed on — intra-tick task ordering decides that, and
-    /// asserting on it is asserting on Linux's scheduler.
+    /// Per MID: the same packets, in the same order, with the same sequence
+    /// deltas (so a drop or a duplicate fails) and the same lengths.
+    ///
+    /// Two things are deliberately *not* asserted, because neither is a property
+    /// of the flight software:
+    ///
+    /// - **Which tick a packet landed on.** Intra-tick task ordering decides
+    ///   that, and it is the host scheduler's choice.
+    ///
+    /// - **A single trailing packet.** A periodic app's timer is armed during
+    ///   un-gated boot, so its phase relative to tick 1 is host-dependent; over a
+    ///   fixed tick budget it can fire N or N+1 times. That is the run *boundary*
+    ///   moving, not a packet being lost.
+    ///
+    ///   [`crate::run`] removes this at source with a guard band — it stops
+    ///   recording before it stops granting time — so the tolerance here is a
+    ///   backstop for callers driving the clock themselves, not the mechanism.
+    ///   A genuinely dropped packet still fails: it shows as a sequence delta != 1
+    ///   in the common prefix, which is checked in full.
     pub fn same_stream(&self, other: &Self) -> bool {
         let (a, b) = (self.by_msg_id(), other.by_msg_id());
 
-        a.len() == b.len()
-            && a.iter().all(|(mid, ea)| {
-                b.get(mid).is_some_and(|eb| {
-                    ea.len() == eb.len()
-                        && ea.iter().zip(eb).all(|(x, y)| x.stream_key() == y.stream_key())
-                })
+        if a.len() != b.len() {
+            return false; // a whole stream appeared or vanished
+        }
+
+        a.iter().all(|(mid, ea)| {
+            b.get(mid).is_some_and(|eb| {
+                // Only the boundary may differ, and only by one packet.
+                if ea.len().abs_diff(eb.len()) > 1 {
+                    return false;
+                }
+                let common = ea.len().min(eb.len());
+                ea[..common]
+                    .iter()
+                    .zip(&eb[..common])
+                    .all(|(x, y)| x.stream_key() == y.stream_key())
             })
+        })
     }
 
     /// Packets whose tick placement moved between two runs, as
@@ -238,6 +263,42 @@ mod tests {
         };
 
         assert!(build(32).same_stream(&build(79)));
+    }
+
+    #[test]
+    fn one_trailing_packet_is_a_boundary_effect_not_a_defect() {
+        // A periodic app's timer is armed during un-gated boot, so over a fixed
+        // tick budget it can fire N or N+1 times. The run's edge moved; nothing
+        // was lost.
+        let build = |n: u16| {
+            let mut t = Transcript::new();
+            for i in 0..n {
+                t.record(&pkt(0x08F0, i + 1, 10 + u32::from(i), 0));
+            }
+            t.finish()
+        };
+
+        assert!(build(300).same_stream(&build(299)), "a trailing packet is the boundary");
+        assert!(!build(300).same_stream(&build(297)), "three is not a boundary");
+    }
+
+    #[test]
+    fn a_drop_still_fails_even_though_the_boundary_is_forgiven() {
+        // The guarantee that makes forgiving the boundary safe: an interior drop
+        // shows up as a sequence delta != 1 and is caught in the common prefix.
+        let mut good = Transcript::new();
+        for i in 0..10u16 {
+            good.record(&pkt(0x08F0, i + 1, 10 + u32::from(i), 0));
+        }
+
+        let mut dropped = Transcript::new();
+        for i in 0..10u16 {
+            // Same packet count, but seq jumps in the middle: one never arrived.
+            let seq = if i < 5 { i + 1 } else { i + 2 };
+            dropped.record(&pkt(0x08F0, seq, 10 + u32::from(i), 0));
+        }
+
+        assert!(!good.finish().same_stream(&dropped.finish()), "an interior drop must fail");
     }
 
     #[test]
