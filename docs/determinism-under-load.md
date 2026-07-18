@@ -54,6 +54,11 @@ A 73% pass rate is unusable for CI, and even the 93% at 16 cores is the worst po
 rare enough to look like a fluke and get re-run, frequent enough to erode trust in every green
 build.
 
+This is not confined to synthetic load. A `check 3000` run immediately after a full cFS build
+came out `90/382 packets shifted, max 5.0 ticks`, then passed 3 times out of 3 once the machine
+went quiet — the ordinary rhythm of working on the project (build, then test) is enough to trip
+it.
+
 ## The mechanism
 
 Tick placement is not measured from when a packet reaches the harness. It is read out of the
@@ -249,6 +254,41 @@ whatever did not fit. Draining inside the loop restored 382/382 identical, 3 run
 Note the shape: 3-tick shifts, not the 10-tick `besom_io` slip that host load produces. A
 determinism harness that reports *how* a run differs, not just that it does, is what made these
 two distinguishable at a glance.
+
+## The second run was not the same scenario as the first
+
+Found while measuring what payload comparison would cost, and worth stating separately because
+it is not about load at all.
+
+cFE's PSP keeps its reserved memory alive between processes. `besomctl check` runs cFS twice, and
+the second run found that memory still valid and came up as a **processor reset** while the first
+came up **power-on**:
+
+| field | run 1 | run 2 |
+|---|---|---|
+| `ResetType` | 2 (POWERON) | 1 (PROCESSOR) |
+| `ProcessorResets` | 0 | 1 |
+| `ERLogEntries` | 1 | 2 |
+| `SysLogEntries` | 39 | 76 |
+| `SysLogBytesUsed` | 3029 | 3072 |
+
+So the tool whose entire job is "run the same scenario twice and compare" was running two
+different scenarios. Neither the packet stream nor tick placement notices — the shape of the run
+is unchanged — which is why this survived every check until payload contents were compared.
+
+It is not cosmetic. Any app that behaves differently after a processor reset — checking its CDS,
+restoring state, replaying its exception log — was being exercised along two different paths, and
+the difference would have been read as a regression in whichever run happened to go second.
+
+Fixed by passing `-R PO`. `PO` is documented as the *default*, which is why this was not obvious:
+the PSP honours existing reserved memory over the default. Measured effect on cross-run payload
+differences at 3000 ticks:
+
+    before:  318/382 packets differ, MIDs 0800 0801 0804 0805 08b8 08f0
+    after:   288/382 packets differ, MID  08f0
+
+Five of the six unstable streams were one root cause rather than five counters, and some run pairs
+now come out byte-identical *including payloads*.
 
 ## Gaps this exposed in the comparison itself
 
