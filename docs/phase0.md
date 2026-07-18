@@ -306,15 +306,47 @@ depending on host timing — a capture artifact, not a determinism failure.
 
 ### Prior art: NOS3 does NOT solve this
 
-Checked directly (`nasa-itc/osal`, `nasa-itc/PSP`, both cloned):
-- Their OSAL fork leaves `OS_TaskDelay_Impl` as a host `clock_nanosleep` — same as stock.
-- **Their PSP has no custom timebase module at all** — just stock `soft_timebase` +
-  `timebase_posix_clock`.
+> **Corrected after re-checking the submodules.** The original text here said NOS3's PSP "has no
+> custom timebase module at all" and that there was no simulated timebase anywhere in its forks.
+> That was wrong, and it was wrong in the dangerous direction — understating a competitor on the
+> one axis this project claims. The error came from reading the top-level `nasa/nos3` checkout
+> without initialising `fsw/osal`, `fsw/psp` and `sims/nos_time_driver`, which are submodules and
+> are empty until you ask for them. Re-checked with all three initialised.
 
-So NOS3 runs cFS on the **real clock, paced to wall time**. It has no deterministic clock and does
-not address the timed-wait problem. `timebase_besom` is already ahead of it, and closing the
-timed-wait gap would be genuinely novel work — plausibly upstreamable, and exactly the kind of
-contribution that gets noticed.
+What NOS3 actually has:
+- An entire NOS OS layer in its OSAL fork: `src/os/nos/` with `NOS-time.c`,
+  `os-impl-nos-gettime.c`, `os-impl-timebase.c`, and NOS-aware semaphore/task implementations.
+- Its timebase reads simulated time: `os-impl-timebase.c:365`,
+  `NOS_clock_gettime(OS_PREFERRED_CLOCK, &local->softsleep)`.
+
+So simulated time IS distributed to the flight software. The difference is upstream of that, in
+who decides when it advances. `sims/nos_time_driver/src/time_driver.cpp` spins on `gettimeofday`
+until `_real_microseconds_per_tick` of REAL time has elapsed, then calls `set_time(_time_counter)`
+on each bus and immediately loops. Nothing acknowledges the tick; nothing waits for cFS to finish
+reacting. Grepped for an ack, barrier or quiescence mechanism — the only matches are the ncurses
+console's command strings.
+
+That makes it a **speed-up knob**, not a decoupled clock: `+`/`-` scale simulated time against the
+wall clock uniformly (capped "no faster than 200x real time"). How much work cFS completes per tick
+still depends on host speed and host load. NOS3 makes no reproducibility claim and has no test that
+compares two runs.
+
+One concrete defect worth knowing, in `src/os/nos/src/os-impl-countsem.c`: the POSIX absolute
+deadline helper is commented out and replaced with a simulated-time read —
+
+```c
+//OS_Posix_CompAbsDelayTime(msecs, &ts);
+NOS_clock_gettime(CLOCK_REALTIME, &ts);
+```
+
+— so a *simulated* timestamp is handed to a *real*-clock wait. That is precisely the class of
+second-order leak this project spent its effort on: controlling the tick source is the easy half,
+and every timed-wait primitive is the hard half.
+
+The defensible claim is therefore narrower than the original and stands up better: NOS3 distributes
+simulated time but its tick source is wall-paced and fire-and-forget, so run-to-run reproducibility
+is not achievable and is not claimed. Besom's step protocol blocks until cFS acknowledges, and the
+harness withholds the next tick until the flight software has gone quiet.
 
 ## Gotchas found the hard way (do not re-learn these)
 

@@ -21,11 +21,41 @@ besomctl loop  # feed vehicle state into cFS; fail if it reports anything stale
 
 cFS is what flies. But you cannot test flight software properly against a clock you do not control:
 the scheduler ticks on wall time, tasks wake on wall time, and two runs of the same scenario differ
-in ways that have nothing to do with the code under test. NASA's own small-sat simulator, NOS3, runs
-cFS on the **real** clock — I checked its OSAL and PSP forks; there is no simulated timebase in
-either.
+in ways that have nothing to do with the code under test.
 
-Besom gives cFS a clock that a test can drive.
+NASA's own small-sat simulator, NOS3, does distribute a simulated clock — its OSAL fork carries a
+whole `src/os/nos/` layer, and the timebase reads it
+([`os-impl-timebase.c:365`](https://github.com/nasa-itc/osal/blob/master/src/os/nos/src/os-impl-timebase.c)).
+So the interesting difference is not whether cFS's clock is simulated. It is **who decides when the
+clock moves**.
+
+In NOS3 the tick source paces itself against the wall clock and publishes fire-and-forget
+([`nos_time_driver/src/time_driver.cpp`](https://github.com/nasa-itc/nos_time_driver)):
+
+```cpp
+do {
+    gettimeofday(&_now, NULL);
+    _last_time_diff = time_diff();
+} while (_last_time_diff < _real_microseconds_per_tick);   // spin until REAL time passes
+...
+_time_bus_info[i].time_bus->set_time(_time_counter);       // publish; do not wait for anyone
+```
+
+Nothing acknowledges the tick and nothing waits for the flight software to finish reacting to it.
+The `+`/`-` keys change `_real_microseconds_per_tick` — it is a *speed-up* knob (capped at "no
+faster than 200x real time"), which makes simulated time run faster or slower than the wall clock
+uniformly, not independent of it. How much work cFS completes per tick therefore still depends on
+how fast the host is and what else it is doing. NOS3 does not claim run-to-run reproducibility, and
+does not test for it.
+
+Besom's clock does not move until the harness says so, and the harness does not say so until cFS
+has stopped reacting to the previous tick. That is the whole difference, and it is why two runs can
+be compared byte-for-byte instead of within a tolerance.
+
+Credit where due: NOS3 is far ahead of Besom on nearly everything else — roughly twenty simulated
+components speaking real UART, I2C, SPI and CAN, [42](https://github.com/ericstoneking/42) for
+dynamics, four ground-system options, and a packaged container. It is a fuller simulator. It is not
+a deterministic one.
 
 ## How it works
 
