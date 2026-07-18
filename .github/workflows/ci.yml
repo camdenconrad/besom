@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The nasa/cFS bundle commit the patches are cut against. Bumping this is a deliberate act:
+  # it changes the flight software under the harness, so a determinism failure right after a
+  # bump means "cFS changed", not "Besom regressed".
+  CFS_REF: d74cc5e
+
+jobs:
+  # The harness must build and its unit tests must pass WITHOUT the GUI feature -- that is the
+  # configuration CI and any headless user get, and it is why the `app` feature exists.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --no-default-features --bin besomctl
+      - run: cargo test --release --no-default-features
+
+  # The claim this project lives or dies on: boot real cFS twice on the simulated clock and get
+  # the same telemetry. Without this job, "deterministic" is an assertion in a README.
+  determinism:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cFS build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      # cFS takes many minutes to build and changes only when the pinned ref or the patches do.
+      #
+      # Cache ONLY the installed output, not the tree: the full checkout+build is ~850 MB while
+      # exe/cpu1 is ~55 MB, and running cFS needs nothing else (core-cpu1 plus its cf/ apps and
+      # tables). ci/build-cfs.sh early-exits when it finds core-cpu1 there, so a cache hit skips
+      # the clone, the submodules and the build entirely.
+      - name: Cache cFS build
+        id: cfs-cache
+        uses: actions/cache@v4
+        with:
+          path: .cfs/build-native_std/exe/cpu1
+          key: cfs-${{ env.CFS_REF }}-${{ hashFiles('patches/*.patch', 'cfs/besom_io/**') }}
+
+      - name: Build cFS
+        run: ci/build-cfs.sh
+
+      - run: cargo build --release --no-default-features --bin besomctl
+
+      # Why the widened quiescence window:
+      #
+      # After every granted tick the harness waits for cFS to stop being runnable before
+      # granting the next one. It declares quiescence after 3 clean samples at 400 us -- a
+      # 1.2 ms window. On a contended machine the lag between granting a tick and the woken
+      # cFS thread being marked R exceeds that, so all three samples come up clean and the
+      # harness moves on while flight software has not started reacting. Measured on a loaded
+      # 16-core host: placement shifts with the timeout counter still reading zero, so the
+      # deadline (BESOM_QUIESCE_MS) is NOT what is being hit and raising it changes nothing.
+      # A runner is more contended than that host, not less.
+      #
+      # So widen the confirmation window and buy determinism with wall-clock. See
+      # docs/determinism-under-load.md for the measurement that ruled the timeout out.
+      #
+      # If this job proves flaky in practice, the honest fallback is BESOM_COOP=0 plus a
+      # stream-only assertion -- NOT a retry loop. A retried determinism check asserts nothing.
+      - name: Determinism check (stream + tick placement)
+        env:
+          BESOM_CFS_DIR: ${{ github.workspace }}/.cfs/build-native_std/exe/cpu1
+          BESOM_COOP: "1"
+          BESOM_QUIESCE_SAMPLES: "20"
+          BESOM_QUIESCE_MS: "15000"
+          # Widening the confirmation window costs ~8 ms per tick, which across the 4000-tick
+          # boot budget alone is ~32 s of extra polling -- straight past the default 60 s
+          # wall-clock boot backstop. Measured: with SAMPLES=20 and the stock timeout, every
+          # run dies with "cFS boot timed out" before recording a single packet. These two
+          # settings must move together.
+          BESOM_BOOT_TIMEOUT_S: "300"
+        run: cargo run --release --no-default-features --bin besomctl -- check 3000
+
+      # Closed loop: state fed in must come back out of the flight software unchanged and
+      # un-stale. Cheaper than the determinism check and catches a different class of break.
+      - name: Closed-loop check
+        env:
+          BESOM_CFS_DIR: ${{ github.workspace }}/.cfs/build-native_std/exe/cpu1
+          BESOM_COOP: "1"
+          BESOM_QUIESCE_SAMPLES: "20"
+          BESOM_QUIESCE_MS: "15000"
+          # Widening the confirmation window costs ~8 ms per tick, which across the 4000-tick
+          # boot budget alone is ~32 s of extra polling -- straight past the default 60 s
+          # wall-clock boot backstop. Measured: with SAMPLES=20 and the stock timeout, every
+          # run dies with "cFS boot timed out" before recording a single packet. These two
+          # settings must move together.
+          BESOM_BOOT_TIMEOUT_S: "300"
+        run: cargo run --release --no-default-features --bin besomctl -- loop 600
+
+# NOT gated yet, deliberately:
+#
+#   cargo fmt --check   -- currently 785 diff lines across 12 files. Turning this on needs a
+#                          one-time `cargo fmt` commit first; doing it inside an unrelated
+#                          change would bury that change in reformatting.
+#   cargo clippy -D warnings -- two pre-existing warnings in src/dynamics.rs (MU_EARTH digit
+#                          grouping, and Vec3::add shadowing std::ops::Add::add). Both are
+#                          judgement calls about that module's style, not defects.
+#
+# Both are worth turning on; neither should be turned on by a robot at 4am.
