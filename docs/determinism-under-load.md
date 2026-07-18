@@ -268,6 +268,27 @@ Measuring the above meant reading `Transcript` closely. Three things it does not
   `tick placement: identical`, and exited 0. Exactly the green build a dead downlink would give.
   Now refused outright.
 
+## What CI actually does on a real runner
+
+The first run of the workflow, on a stock GitHub-hosted runner with
+`BESOM_QUIESCE_SAMPLES=20` and `BESOM_BOOT_TIMEOUT_S=300`:
+
+    stream reproducible: 382 packets, identical
+    tick placement: identical
+    cFS accepted 643 state updates (0 malformed)
+    worst disagreement: lat 0.000000deg  lon 0.000000deg
+    closed loop verified: cFS reports exactly the state it was given
+
+Green, with no `quiescence:` line — zero stalls — and the same 382 packets an idle 16-core
+workstation records. `ci/build-cfs.sh` also built cFS from a clean nasa/cFS clone at the pinned
+ref, so the README's instructions do complete on a machine that has never seen this project.
+
+**This is one run, and one run is not a pass rate.** It says the configuration is viable, not that
+the flakiness measured above is solved: a runner that happened to be quiet proves less than the
+73% measured under deliberate contention. What it does establish is that the strict assertion is
+worth keeping in CI rather than pre-emptively weakened to stream-only — the failure mode to watch
+for is an occasional INCONCLUSIVE, which is diagnosable, rather than silent drift.
+
 ## Still open
 
 * `quiesce` treats every non-`R` thread state as blocked, but `D` (uninterruptible sleep) makes
