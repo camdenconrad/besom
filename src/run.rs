@@ -342,7 +342,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     for _ in 0..ENABLE_TICKS {
         clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
         quiesce::wait(cfs.pid());
-        drain(&tlm, &mut boot_history);
+        drain(&tlm, &mut boot_history, None);
     }
 
     // A REAL guard. TO_LAB_TLMOUTENA_INF_EID (3) is the enable itself, not a boot event, so
@@ -357,7 +357,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     quiesce::wait(cfs.pid());
 
     // Anything emitted while enabling is boot history.
-    drain(&tlm, &mut Transcript::new());
+    drain(&tlm, &mut Transcript::new(), None);
 
     // PHASE-ALIGN THE START.
     //
@@ -373,29 +373,56 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     // once per 1 Hz cycle -- and start the window there. Both ends of the window
     // are then pinned to the same phase, and the number of cycles inside it is
     // fixed.
+    // ANCHOR ON WHAT THE PACKET SAYS, NOT ON WHEN IT SHOWED UP.
+    //
+    // Breaking out the moment a housekeeping packet appears in the socket makes the window
+    // start at the tick we NOTICED it, and noticing is a kernel delivery race: the datagram may
+    // land during this tick's drain or a later one's. Measured across run pairs, the instant we
+    // stopped moved by 1-3 ticks (44020000 vs 44010000, 43970000 vs 44000000), so the run's
+    // whole absolute phase moved with it.
+    //
+    // That was invisible for as long as everything compared was relative -- rel_time is anchored
+    // to each run's own first packet, so a uniform shift cancels exactly. It surfaced only when
+    // telemetry began carrying an ABSOLUTE simulated timestamp (besom_io's SampleUsec), which
+    // then differed by one tick on every sample.
+    //
+    // The fix is not to stop at a cleverer tick -- arrival jitter would still move it -- but to
+    // stop caring which tick we stopped on. The packet's own cFE timestamp records when the
+    // FLIGHT SOFTWARE transmitted it, in simulated time, and is a function of granted ticks
+    // alone. So take the first housekeeping packet's stamp as the anchor and RECORD BY STAMP:
+    // everything earlier is discarded no matter which tick it was noticed on. Late delivery then
+    // changes only how much lead-in is spent, never which packets are in the window.
+    //
+    // (Do not convert that stamp into the harness's own microseconds to compare against the
+    // clock. cFE stamps on its own epoch -- the transcript renders 1980-... -- so the two are
+    // offset by a large constant, and an attempt to step until `sim_usec >= stamp` waits for a
+    // simulated instant some decades away.)
     const SYNC_MID: u16 = 0x0800; // cFE ES housekeeping: one per 1 Hz cycle
     // Generous: the first housekeeping cycle can take a few hundred ticks to
     // appear, because SCH_LAB will not run its table until it has seen a 1 Hz
     // packet from CFE_TIME.
     const SYNC_LIMIT: u32 = 1500;
 
-    let mut synced = false;
+    let mut anchor_stamp: Option<f64> = None;
+
     for _ in 0..SYNC_LIMIT {
         clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
         quiesce::wait(cfs.pid());
         vehicle.step(f64::from(TICK_USEC) / 1e6);
 
         let mut probe = Transcript::new();
-        drain(&tlm, &mut probe);
+        drain(&tlm, &mut probe, None);
 
-        if probe.entries().iter().any(|e| e.msg_id == SYNC_MID) {
-            synced = true;
+        if let Some(stamp) = probe.first_stamp_secs(SYNC_MID) {
+            anchor_stamp = Some(stamp);
             if std::env::var("BESOM_DEBUG_SAMPLES").is_ok() {
-                eprintln!("SYNCTICK {}", clock.sim_usec());
+                eprintln!("SYNCTICK {} stamp={stamp:.5}", clock.sim_usec());
             }
             break;
         }
     }
+
+    let synced = anchor_stamp.is_some();
 
     if !synced {
         bail!("cFS never emitted a housekeeping cycle -- cannot phase-align the run");
@@ -428,7 +455,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
         quiesce::wait(cfs.pid());
 
         let sink = if tick < record_until { &mut transcript } else { &mut discard };
-        drain_with_loop(&tlm, sink, &vehicle, &mut loop_err);
+        drain_with_loop(&tlm, sink, &vehicle, &mut loop_err, anchor_stamp);
 
         vehicle.step(f64::from(TICK_USEC) / 1e6);
     }
@@ -442,7 +469,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     while idle < 2 {
         quiesce::wait(cfs.pid());
         sleep(Duration::from_millis(50));
-        idle = if drain(&tlm, &mut discard) > 0 { 0 } else { idle + 1 };
+        idle = if drain(&tlm, &mut discard, None) > 0 { 0 } else { idle + 1 };
     }
 
     Ok((transcript.finish(), loop_err))
@@ -450,11 +477,18 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
 
 /// Drain, and where a besom_io state packet appears, compare what the flight
 /// software reported against what we actually sent it.
+/// Read everything waiting on the telemetry socket.
+///
+/// `since` is a cFE timestamp: packets the FLIGHT SOFTWARE stamped earlier than it are dropped
+/// rather than recorded. That is what makes the recorded set independent of when datagrams
+/// happened to be delivered -- the window is defined by what the flight software says it sent
+/// and when, not by which tick the harness noticed it.
 fn drain_with_loop(
     sock: &UdpSocket,
     transcript: &mut Transcript,
     vehicle: &Vehicle,
     err: &mut LoopError,
+    since: Option<f64>,
 ) {
     let mut buf = [0u8; 65535];
 
@@ -466,6 +500,10 @@ fn drain_with_loop(
         };
 
         let Ok(pkt) = TlmPacket::parse(&buf[..n]) else { continue };
+
+        if since.is_some_and(|t| pkt.time_secs() < t) {
+            continue; // before the anchor: boot history, whenever it arrived
+        }
 
         if let Some(f) = FswState::parse(pkt.msg_id, &buf[..n]) {
             if std::env::var("BESOM_DEBUG_SAMPLES").is_ok() {
@@ -482,7 +520,7 @@ fn drain_with_loop(
     }
 }
 
-fn drain(sock: &UdpSocket, transcript: &mut Transcript) -> usize {
+fn drain(sock: &UdpSocket, transcript: &mut Transcript, since: Option<f64>) -> usize {
     let mut buf = [0u8; 65535];
     let mut got = 0;
 
@@ -490,6 +528,9 @@ fn drain(sock: &UdpSocket, transcript: &mut Transcript) -> usize {
         match sock.recv_from(&mut buf) {
             Ok((n, _)) => {
                 if let Ok(pkt) = TlmPacket::parse(&buf[..n]) {
+                    if since.is_some_and(|t| pkt.time_secs() < t) {
+                        continue; // before the anchor: boot history, whenever it arrived
+                    }
                     transcript.record(&pkt);
                     got += 1;
                 }

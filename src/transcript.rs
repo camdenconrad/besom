@@ -202,6 +202,22 @@ impl Transcript {
         out
     }
 
+    /// cFE's own timestamp on the first packet of `mid`, in seconds on cFE's epoch.
+    ///
+    /// This is what the FLIGHT SOFTWARE says about when it transmitted, so it is a function of
+    /// granted ticks alone -- unlike the tick on which the harness happened to read the datagram
+    /// out of its socket, which is a kernel delivery race. Anchoring a run on this instead of on
+    /// arrival is what keeps its absolute phase reproducible.
+    ///
+    /// Deliberately NOT converted into the harness's simulated microseconds: cFE stamps on its
+    /// own epoch, so the two differ by a large constant and comparing them directly is a decades
+    /// long wait. Compare stamps with stamps.
+    pub fn first_stamp_secs(&self, mid: MsgId) -> Option<f64> {
+        let epoch = self.epoch?;
+        let rel = self.entries.iter().find(|e| e.msg_id == mid)?.rel_time?;
+        Some(epoch + rel)
+    }
+
     /// Where two runs' packet CONTENTS differ, per MID.
     ///
     /// Returns `(msg_id, packets_of_that_mid, packets_that_differ, differing_byte_offsets)`.
