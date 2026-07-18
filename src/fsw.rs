@@ -24,7 +24,7 @@ const TO_LAB_ADD_PKT_CC: u8 = 2;
 /// simulation link, not a spacecraft downlink. Adding byte-order conversion
 /// would be ceremony that buys nothing and could silently disagree with the C
 /// side.
-pub fn encode_state(v: &Vehicle, sample_usec: u64) -> Vec<u8> {
+pub fn encode_state(v: &Vehicle) -> Vec<u8> {
     let (lat, lon) = v.orbit.subpoint_deg();
 
     let fields = [
@@ -40,15 +40,12 @@ pub fn encode_state(v: &Vehicle, sample_usec: u64) -> Vec<u8> {
         v.attitude.roll,
     ];
 
-    // The stamp leads the state, matching `BESOM_IO_Sample_t`. It travels verbatim into
-    // telemetry with no arithmetic on either side, so the ground can assert WHICH sample was
-    // published rather than merely that plausible-looking state arrived -- which is exactly
-    // what a one-cycle sampling offset defeated for as long as it went unnoticed.
-    sample_usec
-        .to_le_bytes()
-        .into_iter()
-        .chain(fields.iter().flat_map(|f| f.to_le_bytes()))
-        .collect()
+    // State only. The sample's timestamp is applied by besom_io from the PSP's own clock at
+    // the instant it reads this block, NOT supplied here: the harness's clock and cFE's
+    // stamped time sit in different domains whose offset is not constant across runs, so a
+    // stamp minted here made every sample differ run-to-run for reasons unrelated to the
+    // sample. See `BESOM_IO_Sample_t`.
+    fields.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
 /// Vehicle state as the FLIGHT SOFTWARE reports it, decoded from `0x08F0`.
@@ -57,7 +54,8 @@ pub fn encode_state(v: &Vehicle, sample_usec: u64) -> Vec<u8> {
 /// is a far more useful thing to be able to see than either number alone.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FswState {
-    /// The simulated instant the published sample is true at, echoed back from the harness.
+    /// The PSP simulated instant at which the flight software read this sample. Minted inside
+    /// cFS, so it is a function of granted ticks alone.
     pub sample_usec: u64,
     pub alt_km: f64,
     pub lat_deg: f64,
@@ -140,13 +138,14 @@ mod tests {
         // and the decoder ever disagree the loop silently reports garbage, so
         // pin the layout from both ends.
         let v = Vehicle::default();
-        let bytes = encode_state(&v, 1_234_000);
-        assert_eq!(bytes.len(), 88, "u64 stamp + ten f64");
+        let bytes = encode_state(&v);
+        assert_eq!(bytes.len(), 80, "ten f64 of state; the stamp is minted inside cFS");
 
         // Rebuild a telemetry packet the way besom_io publishes it. The wire block IS the
         // telemetry sample prefix -- besom_io copies it across with no repacking -- so this
         // needs no slicing, and that identity is itself part of the contract being pinned.
         let mut pkt = vec![0u8; 16];
+        pkt.extend_from_slice(&1_234_000u64.to_le_bytes()); // SampleUsec, applied by besom_io
         pkt.extend_from_slice(&bytes);
         pkt.extend_from_slice(&7u32.to_le_bytes()); // RxCount
         pkt.extend_from_slice(&0u32.to_le_bytes()); // RxErrCount
@@ -156,7 +155,7 @@ mod tests {
         let s = FswState::parse(STATE_TLM_MID, &pkt).unwrap();
 
         let (lat, lon) = v.orbit.subpoint_deg();
-        assert_eq!(s.sample_usec, 1_234_000, "the stamp survives verbatim");
+        assert_eq!(s.sample_usec, 1_234_000, "besom_io's stamp leads the state");
         assert!((s.alt_km - v.orbit.altitude_km()).abs() < 1e-9);
         assert!((s.lat_deg - lat).abs() < 1e-9);
         assert!((s.lon_deg - lon).abs() < 1e-9);

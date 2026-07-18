@@ -264,7 +264,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
             // Feed from the very first tick. The sensor rides the step, so this costs no
             // extra syscall -- and it guarantees the PSP holds a block before besom_io's timer
             // can ever fire, so there is no startup window in which the app has no sample.
-            clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
+            clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle))?;
             quiesce::wait(cfs.pid());
 
             if !booted && cfs.log_contains("entering OPERATIONAL state") {
@@ -340,7 +340,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     const ENABLE_TICKS: u32 = 200;
     let mut boot_history = Transcript::new();
     for _ in 0..ENABLE_TICKS {
-        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
+        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle))?;
         quiesce::wait(cfs.pid());
         drain(&tlm, &mut boot_history, None);
     }
@@ -406,7 +406,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     let mut anchor_stamp: Option<f64> = None;
 
     for _ in 0..SYNC_LIMIT {
-        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
+        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle))?;
         quiesce::wait(cfs.pid());
         vehicle.step(f64::from(TICK_USEC) / 1e6);
 
@@ -451,7 +451,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
         // The sensor block IS the step. "Deliver state before granting the tick that lets the
         // flight software look for it" used to be a convention this loop had to remember; now
         // there is one datagram and the state is in it, so the ordering cannot be got wrong.
-        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
+        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle))?;
         quiesce::wait(cfs.pid());
 
         let sink = if tick < record_until { &mut transcript } else { &mut discard };
@@ -507,7 +507,7 @@ fn drain_with_loop(
 
         if let Some(f) = FswState::parse(pkt.msg_id, &buf[..n]) {
             if std::env::var("BESOM_DEBUG_SAMPLES").is_ok() {
-                eprintln!("SAMPLE {} {:.9} {:.9}", f.sample_usec, f.lat_deg, f.lon_deg);
+                eprintln!("SAMPLE psp={} cfe={:.5} lat={:.9}", f.sample_usec, pkt.time_secs(), f.lat_deg);
             }
             let (lat, lon) = vehicle.orbit.subpoint_deg();
             err.max_lat_deg = err.max_lat_deg.max((f.lat_deg - lat).abs());

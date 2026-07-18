@@ -240,7 +240,7 @@ fn drive(cfg: Config, rx: Receiver<Cmd>, state: &Arc<Mutex<State>>) -> Result<()
                 // delivery timing.
                 let sensor = {
                     let s = state.lock().unwrap();
-                    fsw::encode_state(&s.vehicle, clock.sim_usec())
+                    fsw::encode_state(&s.vehicle)
                 };
                 clock.step_with_sensor(TICK_USEC, &sensor)?;
                 quiesce::wait(cfs.pid());

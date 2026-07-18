@@ -60,6 +60,8 @@ BESOM_IO_Data_t BESOM_IO_Data;
 static void BESOM_IO_TimerCallback(osal_id_t object_id, void *arg)
 {
     BESOM_IO_Sample_t sample;
+    BESOM_IO_State_t  state;
+    OS_time_t         now;
     uint32            size = 0;
     uint32            seq  = 0;
     int32             status;
@@ -78,13 +80,26 @@ static void BESOM_IO_TimerCallback(osal_id_t object_id, void *arg)
         return;
     }
 
-    status = CFE_PSP_Besom_GetSensorBlock(&sample, sizeof(sample), &size, &seq);
+    status = CFE_PSP_Besom_GetSensorBlock(&state, sizeof(state), &size, &seq);
 
-    if (status != CFE_PSP_SUCCESS || size != sizeof(sample))
+    /*
+     * Stamp from the PSP's simulated clock, not from anything the harness said.
+     * This is the same clock the timebase advances, read on the timebase thread
+     * inside the dispatch for this tick, so the stamp is a pure function of
+     * granted ticks -- see BESOM_IO_Sample_t for why echoing the harness's own
+     * stamp was not.
+     */
+    CFE_PSP_GetTime(&now);
+    sample.SampleUsec = (uint64)OS_TimeGetTotalMicroseconds(now);
+    sample.State      = state;
+
+    if (status != CFE_PSP_SUCCESS || size != sizeof(state))
     {
-        /* Republish the previous latch rather than a torn or absent one. */
+        /* Keep the previous reading's STATE rather than a torn or absent one, but stamp it
+         * with now: the packet still describes this firing, it just carries stale contents,
+         * and RxErrCount is what says so. */
         ++BESOM_IO_Data.HkTlm.Payload.RxErrCount;
-        sample = BESOM_IO_Data.Ring[(BESOM_IO_Data.Write - 1) & (BESOM_IO_RING - 1)];
+        sample.State = BESOM_IO_Data.Ring[(BESOM_IO_Data.Write - 1) & (BESOM_IO_RING - 1)].State;
     }
     else if (seq == BESOM_IO_Data.LastSeq)
     {

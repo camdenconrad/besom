@@ -48,19 +48,24 @@ typedef struct
 } BESOM_IO_State_t;
 
 /*
- * One sensor reading: the state, and the simulated instant at which it is true.
+ * One sensor reading: the state, and the simulated instant at which it was read.
  *
- * SampleUsec travels verbatim from the harness to telemetry -- no arithmetic on
- * either side. The ground can therefore check *which* sample was published, not
- * merely that some plausible-looking state arrived, which is the difference that
- * made a one-cycle sampling offset invisible for so long.
+ * SampleUsec comes from CFE_PSP_GetTime at the moment the block is read -- the
+ * PSP's own simulated clock, which advances by exactly the granted ticks and
+ * nothing else. It is deliberately NOT the stamp the harness supplies.
  *
- * Byte-identical to the block the harness puts on the wire, so the app copies it
- * straight into telemetry with no repacking.
+ * The harness's clock and cFE's *stamped* time are different domains, and the
+ * offset between them is not constant across runs: measured, two runs anchored on
+ * the identical cFE packet timestamp while their harness clocks stood two ticks
+ * apart, because a packet's cFE timestamp comes from CFE_TIME's view rather than
+ * straight from the PSP. Echoing the harness's number therefore made every sample
+ * differ run-to-run for a reason that had nothing to do with the sample. Reading
+ * the PSP clock here puts the stamp in the same domain as everything else the
+ * transcript compares.
  */
 typedef struct
 {
-    uint64           SampleUsec; /**< simulated usec at which State is true */
+    uint64           SampleUsec; /**< PSP simulated usec at which State was read */
     BESOM_IO_State_t State;
 } BESOM_IO_Sample_t;
 
