@@ -37,7 +37,15 @@ pub struct TlmPacket {
     ///
     /// The 12-byte cut is what makes this comparable at all: the packet's own timestamp lives at
     /// bytes 6..12, and that legitimately differs with tick placement, so excluding the header
-    /// excludes it. Everything from byte 12 on is the app's own output.
+    /// excludes it.
+    ///
+    /// NOTE the cut is CCSDS-correct but not cFE-correct. `CFE_MSG_TelemetryHeader_t` is **16**
+    /// bytes -- 6 primary, 6 secondary, then `uint8 Spare[4]` to align the payload -- so bytes
+    /// 0..4 here are that spare, and an offset reported against this buffer is **4 higher** than
+    /// the same field's offset in the cFE payload struct. Measured stable (the spare does not
+    /// vary between runs), so it costs nothing to compare; it matters only when mapping a
+    /// differing offset back to a field, e.g. offset 20 here is `SysLogBytesUsed` at struct
+    /// offset 16 in `CFE_ES_HousekeepingTlm_Payload_t`.
     pub payload: Vec<u8>,
 }
 

@@ -114,6 +114,7 @@ fn main() -> Result<()> {
                     "payload: {differing}/{} packets differ (not asserted -- see issue #4)",
                     a.len()
                 );
+                println!("  (offsets are payload-relative; subtract 4 for the cFE struct offset)");
                 for (mid, compared, diff, offsets) in &pdiff {
                     let shown: Vec<String> =
                         offsets.iter().take(12).map(|o| o.to_string()).collect();
