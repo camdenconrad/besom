@@ -39,6 +39,13 @@ pub struct Entry {
     /// `None` for packets that arrived before the anchor.
     pub rel_time: Option<f64>,
     pub len: usize,
+    /// The packet's contents, everything after the 12-byte header.
+    ///
+    /// Retained but NOT yet part of [`Entry::stream_key`], so this changes no verdict: turning it
+    /// on is gated on the sources of cross-run payload difference being fixed first (see #4).
+    /// Measured today, 319 of 382 packets differ across two runs, so asserting on it now would
+    /// simply make `check` permanently red.
+    pub payload: Vec<u8>,
 }
 
 impl Entry {
@@ -84,7 +91,13 @@ impl Transcript {
             .insert(pkt.msg_id, pkt.seq)
             .map(|prev| pkt.seq.wrapping_sub(prev) & 0x3FFF);
 
-        self.entries.push(Entry { msg_id: pkt.msg_id, seq_delta, rel_time, len: pkt.len });
+        self.entries.push(Entry {
+            msg_id: pkt.msg_id,
+            seq_delta,
+            rel_time,
+            len: pkt.len,
+            payload: pkt.payload.clone(),
+        });
     }
 
     /// Finish the run: sort same-instant packets so they compare stably.
@@ -220,7 +233,28 @@ mod tests {
     use super::*;
 
     fn pkt(msg_id: MsgId, seq: u16, secs: u32, subsecs: u16) -> TlmPacket {
-        TlmPacket { msg_id, seq, secs, subsecs, len: 32 }
+        TlmPacket { msg_id, seq, secs, subsecs, len: 32, payload: vec![0; 20] }
+    }
+
+    #[test]
+    fn payload_is_retained_but_not_yet_asserted_on() {
+        // Retention is a prerequisite for comparing contents; the comparison itself is gated on
+        // the cross-run payload differences being fixed at source (#4). Until then two runs whose
+        // payloads differ must still compare equal, or `check` goes permanently red.
+        let mut a = Transcript::new();
+        let mut b = Transcript::new();
+
+        let mut pa = pkt(0x0800, 1, 100, 0);
+        let mut pb = pkt(0x0800, 1, 100, 0);
+        pa.payload = vec![0xAA; 20];
+        pb.payload = vec![0xBB; 20];
+        a.record(&pa);
+        b.record(&pb);
+
+        let (a, b) = (a.finish(), b.finish());
+        assert_eq!(a.entries()[0].payload, vec![0xAA; 20], "payload must survive into the entry");
+        assert_ne!(a.entries()[0].payload, b.entries()[0].payload);
+        assert!(a.same_stream(&b), "payload must not yet affect the verdict");
     }
 
     #[test]

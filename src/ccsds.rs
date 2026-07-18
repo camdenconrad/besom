@@ -15,7 +15,8 @@ pub type MsgId = u16;
 /// the first *periodic* packet instead of this one.
 pub const EVS_EVENT_MID: MsgId = 0x0808;
 
-/// A decoded telemetry packet. Only the fields a transcript needs to assert on.
+/// A decoded telemetry packet: the fields a transcript needs to assert on, and the payload
+/// bytes it needs to assert *with*.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlmPacket {
     pub msg_id: MsgId,
@@ -28,6 +29,16 @@ pub struct TlmPacket {
     /// Subseconds, in units of 1/65536 s.
     pub subsecs: u16,
     pub len: usize,
+    /// Everything after the 12-byte header: the packet's actual contents.
+    ///
+    /// Retained because a comparison that never looks at it cannot see a WRONG VALUE -- a packet
+    /// whose contents changed but whose identity, length and sequence did not is invisible, which
+    /// is the single most valuable regression class a flight-software harness should catch.
+    ///
+    /// The 12-byte cut is what makes this comparable at all: the packet's own timestamp lives at
+    /// bytes 6..12, and that legitimately differs with tick placement, so excluding the header
+    /// excludes it. Everything from byte 12 on is the app's own output.
+    pub payload: Vec<u8>,
 }
 
 impl TlmPacket {
@@ -50,6 +61,7 @@ impl TlmPacket {
             secs: u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]),
             subsecs: u16::from_be_bytes([buf[10], buf[11]]),
             len: buf.len(),
+            payload: buf[12..].to_vec(),
         })
     }
 }
