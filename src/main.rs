@@ -192,9 +192,23 @@ fn main() -> Result<()> {
 
             let Some(f) = l.last else { bail!("no state") };
             println!(
-                "cFS accepted {} state updates ({} malformed)",
-                f.rx_count, f.rx_err_count
+                "cFS accepted {} state updates ({} malformed, {} stale, {} overrun)",
+                f.rx_count, f.rx_err_count, f.stale_count, f.overrun_count
             );
+            println!("last sample stamped at {} us of simulated time", f.sample_usec);
+
+            // These are defects, not statistics. A stale firing means a tick was granted with
+            // no sensor block; an overrun means the app task fell behind its own timer and a
+            // reading was dropped. Either makes the published stream depend on something other
+            // than simulated time, which is the whole thing this bus exists to prevent.
+            if f.rx_err_count != 0 || f.stale_count != 0 || f.overrun_count != 0 {
+                bail!(
+                    "sensor bus degraded: {} malformed, {} stale, {} overrun",
+                    f.rx_err_count,
+                    f.stale_count,
+                    f.overrun_count
+                );
+            }
             println!(
                 "worst disagreement: lat {:.6}deg  lon {:.6}deg",
                 l.max_lat_deg, l.max_lon_deg

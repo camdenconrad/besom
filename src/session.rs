@@ -143,7 +143,6 @@ fn drive(cfg: Config, rx: Receiver<Cmd>, state: &Arc<Mutex<State>>) -> Result<()
     let tlm = UdpSocket::bind(("0.0.0.0", TLM_PORT))?;
     tlm.set_nonblocking(true)?;
     let uplink = UdpSocket::bind(("0.0.0.0", 0))?;
-    let sensors = UdpSocket::bind(("0.0.0.0", 0))?; // vehicle state -> besom_io
 
     // Enable the downlink with the clock still frozen, so it takes effect at an
     // exact simulated instant rather than whenever the host got round to it.
@@ -234,17 +233,16 @@ fn drive(cfg: Config, rx: Receiver<Cmd>, state: &Arc<Mutex<State>>) -> Result<()
             // changes how fast we drive cFS -- never whether it keeps up.
             let n = if budget > 0 { 1 } else { warp };
             for _ in 0..n {
-                // Deliver sensor data BEFORE granting the tick that lets the
-                // flight software look for it. besom_io reads its socket
-                // non-blocking on a sim-clock timer, so the datagram must already
-                // be waiting -- otherwise whether cFS sees this tick's state
-                // depends on host scheduling, and the run stops being reproducible.
-                {
+                // State rides the step: one datagram, installed by the PSP before simulated
+                // time advances, so the flight software cannot observe a tick without the
+                // state belonging to it. This used to be a separate UDP send that had to
+                // happen first, and whether cFS saw this tick's state then depended on host
+                // delivery timing.
+                let sensor = {
                     let s = state.lock().unwrap();
-                    let _ = sensors.send_to(&fsw::encode_state(&s.vehicle), ("127.0.0.1", fsw::STATE_PORT));
-                }
-
-                clock.step(TICK_USEC)?;
+                    fsw::encode_state(&s.vehicle, clock.sim_usec())
+                };
+                clock.step_with_sensor(TICK_USEC, &sensor)?;
                 quiesce::wait(cfs.pid());
 
                 // Propagate between ticks so the state we send next tick is the

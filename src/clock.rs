@@ -4,11 +4,21 @@
 //! datagram socket. cFE time advances only when we send a step, so this type is
 //! the sole source of time for the flight software.
 //!
-//! Wire protocol (v0), little-endian, over `$BESOM_STEP_SOCK`:
+//! Wire protocol (v1), little-endian, over `$BESOM_STEP_SOCK`:
 //! ```text
-//!   Besom -> PSP : u32  step_usec   (microseconds to advance; must be nonzero)
-//!   PSP  -> Besom: u64  sim_usec    (simulated clock, AFTER the step is dispatched)
+//!   Besom -> PSP : u32  step_usec    (microseconds to advance; must be nonzero)
+//!                  u32  sensor_len   (optional; omitted or 0 = no sensor block)
+//!                  u8[] sensor_block (opaque to the PSP)
+//!   PSP  -> Besom: u64  sim_usec     (simulated clock, AFTER the step is dispatched)
 //! ```
+//!
+//! A bare 4-byte step is still valid v0, so an unpatched PSP and the free-running path both
+//! keep working.
+//!
+//! The sensor block travels *inside* the step because that is what makes the flight software's
+//! view of the world a function of simulated time. The PSP installs it before advancing the
+//! clock, so there is no instant at which cFS is at time T without the state belonging to T,
+//! and no queue whose depth the kernel could decide. See [`crate::fsw`].
 //!
 //! The reply is sent from the *entry* of the PSP's next sync call. OSAL only
 //! re-enters that function once it has finished walking the timebase's callback
@@ -59,10 +69,31 @@ impl Clock {
 
     /// Grant one tick and block until cFE has dispatched it.
     pub fn step(&mut self, usec: u32) -> Result<u64> {
+        self.step_with_sensor(usec, &[])
+    }
+
+    /// Grant one tick, delivering `sensor` to the flight software as part of it.
+    ///
+    /// The sensor block rides the step rather than travelling on a socket of its own, and that
+    /// is the whole point: the PSP installs it *before* advancing simulated time, so cFS cannot
+    /// observe time T without also observing the state belonging to T. Sending state separately
+    /// meant the flight software saw whatever the kernel had delivered by the time it looked,
+    /// which is a host decision -- it published a sample a full cycle stale in some runs and not
+    /// others, identically and invisibly in each.
+    ///
+    /// An empty `sensor` sends a bare v0 step, which the PSP still accepts.
+    pub fn step_with_sensor(&mut self, usec: u32, sensor: &[u8]) -> Result<u64> {
         assert!(usec > 0, "a zero step would tell the PSP no time has passed");
 
+        let mut msg = Vec::with_capacity(8 + sensor.len());
+        msg.extend_from_slice(&usec.to_le_bytes());
+        if !sensor.is_empty() {
+            msg.extend_from_slice(&(sensor.len() as u32).to_le_bytes());
+            msg.extend_from_slice(sensor);
+        }
+
         self.sock
-            .send_to(&usec.to_le_bytes(), &self.psp_path)
+            .send_to(&msg, &self.psp_path)
             .with_context(|| format!("sending step to {}", self.psp_path.display()))?;
 
         let mut reply = [0u8; 8];

@@ -1,3 +1,66 @@
+diff --git a/fsw/inc/cfe_psp_besom.h b/fsw/inc/cfe_psp_besom.h
+new file mode 100644
+index 0000000..8ac310e
+--- /dev/null
++++ b/fsw/inc/cfe_psp_besom.h
+@@ -0,0 +1,57 @@
++/************************************************************************
++ * Besom sensor bus -- the flight-software side of the harness's step protocol.
++ *
++ * Simulated vehicle state arrives INSIDE the timebase step rather than on a
++ * socket of its own. The timebase module installs it before advancing simulated
++ * time, so an app cannot observe time T without also observing the state that
++ * belongs to T, and there is no queue anywhere whose depth the host could decide.
++ *
++ * This replaced a UDP feed that besom_io drained on its own cycle. How many
++ * datagrams had arrived by the time it looked was the kernel's business, so the
++ * app published a sample one full cycle off between otherwise identical runs.
++ * Both runs were internally consistent, which is why no existing check saw it.
++ ************************************************************************/
++
++#ifndef CFE_PSP_BESOM_H
++#define CFE_PSP_BESOM_H
++
++#include "common_types.h"
++
++/**
++ * Largest sensor block the timebase will carry, in bytes.
++ *
++ * The PSP never interprets the contents -- it is a byte pipe with a sequence
++ * number -- so the layout stays a private contract between the harness and the
++ * app that consumes it, and this header needs no revision when that changes.
++ */
++#define CFE_PSP_BESOM_SENSOR_MAX 256
++
++/**
++ * \brief Fetch the sensor block delivered with the tick being processed.
++ *
++ * \par Threading
++ * Callable ONLY from the timebase thread, meaning from inside a timer callback
++ * bound to "cFS-Master". This is enforced, not advisory: called from a task
++ * thread it returns #CFE_PSP_ERROR and writes nothing.
++ *
++ * The restriction is the mechanism. A task thread would read whatever the
++ * timebase thread last wrote, with no defined relationship to that task's own
++ * notion of time -- reintroducing exactly the host-dependent sampling this
++ * design removes. On the timebase thread the read is ordered against the write
++ * by program order, and the step protocol serialises the next tick behind the
++ * previous acknowledgement, so no other tick can be in flight.
++ *
++ * \param[in]  dest      Destination buffer.
++ * \param[in]  max_size  Capacity of \p dest. Fails if the block is larger.
++ * \param[out] out_size  Bytes written.
++ * \param[out] out_seq   Monotonic block counter. Unchanged between two calls
++ *                       means the harness supplied no new state for this tick;
++ *                       the caller decides whether that is stale or an error.
++ *
++ * \return #CFE_PSP_SUCCESS, or #CFE_PSP_ERROR on the wrong thread, before any
++ *         block has been installed, on a null argument, or if \p max_size is
++ *         too small.
++ */
++int32 CFE_PSP_Besom_GetSensorBlock(void *dest, uint32 max_size, uint32 *out_size, uint32 *out_seq);
++
++#endif /* CFE_PSP_BESOM_H */
 diff --git a/fsw/modules/timebase_besom/CMakeLists.txt b/fsw/modules/timebase_besom/CMakeLists.txt
 new file mode 100644
 index 0000000..81d4370
@@ -7,10 +70,10 @@ index 0000000..81d4370
 +add_psp_module(timebase_besom cfe_psp_timebase_besom.c)
 diff --git a/fsw/modules/timebase_besom/cfe_psp_timebase_besom.c b/fsw/modules/timebase_besom/cfe_psp_timebase_besom.c
 new file mode 100644
-index 0000000..8cb49cf
+index 0000000..755c8f1
 --- /dev/null
 +++ b/fsw/modules/timebase_besom/cfe_psp_timebase_besom.c
-@@ -0,0 +1,270 @@
+@@ -0,0 +1,395 @@
 +/************************************************************************
 + * Besom deterministic timebase
 + *
@@ -25,9 +88,29 @@ index 0000000..8cb49cf
 + * function blocks on a UNIX datagram socket, so cFE time advances only when
 + * the Besom harness sends a step.  No cFE core changes are required.
 + *
-+ * Wire protocol (v0), little-endian, over $BESOM_STEP_SOCK:
-+ *   Besom -> PSP : u32  step_usec   (microseconds to advance; must be nonzero)
-+ *   PSP  -> Besom: u64  sim_usec    (simulated clock AFTER applying the step)
++ * Wire protocol (v1), little-endian, over $BESOM_STEP_SOCK:
++ *   Besom -> PSP : u32  step_usec    (microseconds to advance; must be nonzero)
++ *                  u32  sensor_len   (optional; 0 or absent = no sensor block)
++ *                  u8[] sensor_block (opaque to the PSP)
++ *   PSP  -> Besom: u64  sim_usec     (simulated clock AFTER applying the step)
++ *
++ * A bare 4-byte datagram is still a valid v0 step, so an older harness and the
++ * free-running path both keep working.
++ *
++ * WHY THE SENSOR RIDES THE STEP.  Simulated vehicle state used to reach the
++ * flight software as its own UDP datagram, which besom_io drained on its own
++ * 10 Hz cycle.  How many datagrams had physically arrived by then was decided
++ * by the kernel, not by simulated time, so the app latched a sample one full
++ * cycle off between otherwise identical runs -- measured as an exact 0.1 s
++ * offset in published position, invisible to every check because both runs were
++ * internally consistent.  Carrying the state IN the step means there is no queue
++ * to have a host-dependent depth: the block is installed before sim_usec
++ * advances, in the same call on the same thread, so cFS cannot observe time T
++ * without also observing the state that belongs to T.
++ *
++ * The PSP is deliberately dumb about the block's contents -- a byte pipe with a
++ * sequence number -- so the state layout stays a private contract between the
++ * harness and besom_io, and this file needs no revision when it changes.
 + *
 + * The reply is sent before cFE has finished acting on the tick, so it paces
 + * Besom but does not by itself prove quiescence.  See BESOM-PHASE0 notes.
@@ -47,10 +130,12 @@ index 0000000..8cb49cf
 +#include <stdbool.h>
 +#include <sys/socket.h>
 +#include <sys/un.h>
++#include <pthread.h>
 +
 +#include "cfe_psp.h"
 +#include "cfe_psp_module.h"
 +#include "cfe_psp_config.h"
++#include "cfe_psp_besom.h"
 +
 +CFE_PSP_MODULE_DECLARE_SIMPLE(timebase_besom);
 +
@@ -74,6 +159,23 @@ index 0000000..8cb49cf
 +     * CFE_PSP_GetTime(), so it must be atomic.
 +     */
 +    atomic_ullong sim_usec;
++
++    /*
++     * The sensor block delivered with the current tick.
++     *
++     * NOT atomic and deliberately unlocked: it is written by the timebase helper
++     * thread in PSP_Besom_StepSync and read by that SAME thread from inside the
++     * timer callbacks OSAL dispatches before re-entering StepSync.  Ordering is
++     * program order, and the step protocol serialises the next write behind the
++     * previous ack, so no other tick can be in flight.  The accessor enforces
++     * the read-site half of that invariant rather than documenting it -- see
++     * CFE_PSP_Besom_GetSensorBlock.
++     */
++    uint8     sensor[CFE_PSP_BESOM_SENSOR_MAX];
++    uint32    sensor_len;
++    uint32    sensor_seq;        /* 0 = nothing ever installed */
++    pthread_t tick_thread;
++    bool      tick_thread_valid;
 +} PSP_Besom_Global;
 +
 +/*
@@ -105,8 +207,24 @@ index 0000000..8cb49cf
 +static uint32 PSP_Besom_StepSync(osal_id_t timebase_id)
 +{
 +    uint32             step_usec;
++    uint32             sensor_len;
++    uint8              buf[8 + CFE_PSP_BESOM_SENSOR_MAX];
 +    ssize_t            n;
 +    unsigned long long now_usec;
++
++    /*
++     * Record the thread OSAL runs the timebase on. Timer callbacks are
++     * dispatched from this same thread (OS_TimeBase_CallbackThread walks the
++     * callback list before re-entering this function), which is what lets
++     * besom_io read the sensor slot with no synchronisation -- and what the
++     * accessor checks, so a read from any other thread fails loudly instead of
++     * quietly returning whatever this thread last wrote.
++     */
++    if (!PSP_Besom_Global.tick_thread_valid)
++    {
++        PSP_Besom_Global.tick_thread       = pthread_self();
++        PSP_Besom_Global.tick_thread_valid = true;
++    }
 +
 +    /*
 +     * Acknowledge the PREVIOUS step here, at function entry, rather than right
@@ -134,13 +252,44 @@ index 0000000..8cb49cf
 +
 +    PSP_Besom_Global.peer_len = sizeof(PSP_Besom_Global.peer);
 +
-+    n = recvfrom(PSP_Besom_Global.sock, &step_usec, sizeof(step_usec), 0,
++    n = recvfrom(PSP_Besom_Global.sock, buf, sizeof(buf), 0,
 +                 (struct sockaddr *)&PSP_Besom_Global.peer, &PSP_Besom_Global.peer_len);
 +
-+    if (n != (ssize_t)sizeof(step_usec) || step_usec == 0)
++    if (n < (ssize_t)sizeof(step_usec))
 +    {
-+        /* EINTR, short read, or a zero step: no time has passed. */
++        /* EINTR or a short read: no time has passed. */
 +        return 0;
++    }
++
++    memcpy(&step_usec, buf, sizeof(step_usec));
++
++    if (step_usec == 0)
++    {
++        return 0;
++    }
++
++    /*
++     * INSTALL THE SENSOR BLOCK BEFORE ADVANCING TIME.
++     *
++     * This ordering is the whole guarantee. cFS cannot observe simulated time T
++     * without also observing the state that belongs to T, because the only thing
++     * that publishes T is the atomic_fetch_add below, and it happens after the
++     * memcpy. The clock and the sensor bus fail independently: a malformed or
++     * oversized block is ignored and the step still applies, so a sensor problem
++     * can never stall the clock.
++     */
++    if (n >= (ssize_t)(sizeof(step_usec) + sizeof(sensor_len)))
++    {
++        memcpy(&sensor_len, buf + sizeof(step_usec), sizeof(sensor_len));
++
++        if (sensor_len > 0 && sensor_len <= CFE_PSP_BESOM_SENSOR_MAX &&
++            n == (ssize_t)(sizeof(step_usec) + sizeof(sensor_len) + sensor_len))
++        {
++            memcpy(PSP_Besom_Global.sensor, buf + sizeof(step_usec) + sizeof(sensor_len),
++                   sensor_len);
++            PSP_Besom_Global.sensor_len = sensor_len;
++            ++PSP_Besom_Global.sensor_seq;
++        }
 +    }
 +
 +    atomic_fetch_add(&PSP_Besom_Global.sim_usec, step_usec);
@@ -151,6 +300,45 @@ index 0000000..8cb49cf
 +    }
 +
 +    return step_usec;
++}
++
++/*
++ * Hand the current tick's sensor block to the caller.
++ *
++ * Callable ONLY from the timebase thread -- i.e. from inside a timer callback
++ * dispatched for the tick being processed. That restriction is the point, not an
++ * inconvenience: a task thread reading this slot would see whatever the timebase
++ * thread last wrote, with no defined relationship to the task's own notion of
++ * time, which is exactly the class of host-dependent read this design exists to
++ * remove. Enforcing it here turns an invariant that would otherwise live in a
++ * comment into one the compiler's users cannot violate by accident.
++ *
++ * Fails closed: on the wrong thread, before any block has been installed, or
++ * with too small a destination, it returns CFE_PSP_ERROR and writes nothing.
++ */
++int32 CFE_PSP_Besom_GetSensorBlock(void *dest, uint32 max_size, uint32 *out_size, uint32 *out_seq)
++{
++    if (dest == NULL || out_size == NULL || out_seq == NULL)
++    {
++        return CFE_PSP_ERROR;
++    }
++
++    if (!PSP_Besom_Global.tick_thread_valid ||
++        !pthread_equal(pthread_self(), PSP_Besom_Global.tick_thread))
++    {
++        return CFE_PSP_ERROR;
++    }
++
++    if (PSP_Besom_Global.sensor_seq == 0 || PSP_Besom_Global.sensor_len > max_size)
++    {
++        return CFE_PSP_ERROR;
++    }
++
++    memcpy(dest, PSP_Besom_Global.sensor, PSP_Besom_Global.sensor_len);
++    *out_size = PSP_Besom_Global.sensor_len;
++    *out_seq  = PSP_Besom_Global.sensor_seq;
++
++    return CFE_PSP_SUCCESS;
 +}
 +
 +/*
@@ -282,16 +470,15 @@ index 0000000..8cb49cf
 +    return 0;
 +}
 diff --git a/fsw/pc-linux/psp_module_list.cmake b/fsw/pc-linux/psp_module_list.cmake
-index c574398..cda0045 100644
+index c574398..5560692 100644
 --- a/fsw/pc-linux/psp_module_list.cmake
 +++ b/fsw/pc-linux/psp_module_list.cmake
-@@ -1,8 +1,7 @@
+@@ -1,8 +1,6 @@
  # This is a list of modules that is included as a fixed/base set
  # when this PSP is selected.  They must exist under fsw/modules
  
 -soft_timebase
 -timebase_posix_clock
-+timebase_besom
  eeprom_mmap_file
  port_notimpl
  iodriver

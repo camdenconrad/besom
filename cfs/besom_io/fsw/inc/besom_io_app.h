@@ -15,11 +15,16 @@
  */
 #define BESOM_IO_STATE_TLM_MID 0x08F0
 
-/* Where the harness sends vehicle state. */
-#define BESOM_IO_STATE_PORT 5010
-
 /* 10 Hz of SIMULATED time (the timebase Besom steps, not the host clock). */
 #define BESOM_IO_RATE_USEC 100000
+
+/*
+ * Latches held between the timer callback (which reads the sensor block) and the
+ * app task (which publishes it). Four is generous: the task is normally one
+ * cycle behind at most, and a full ring is a counted, visible failure rather
+ * than a silent overwrite -- see OverrunCount.
+ */
+#define BESOM_IO_RING 4
 
 #define BESOM_IO_PERF_ID 0x60
 #define BESOM_IO_INIT_EID 1
@@ -42,11 +47,30 @@ typedef struct
     double Roll;      /**< Body roll about nadir, radians */
 } BESOM_IO_State_t;
 
+/*
+ * One sensor reading: the state, and the simulated instant at which it is true.
+ *
+ * SampleUsec travels verbatim from the harness to telemetry -- no arithmetic on
+ * either side. The ground can therefore check *which* sample was published, not
+ * merely that some plausible-looking state arrived, which is the difference that
+ * made a one-cycle sampling offset invisible for so long.
+ *
+ * Byte-identical to the block the harness puts on the wire, so the app copies it
+ * straight into telemetry with no repacking.
+ */
 typedef struct
 {
+    uint64           SampleUsec; /**< simulated usec at which State is true */
     BESOM_IO_State_t State;
-    uint32           RxCount;    /**< state datagrams accepted */
-    uint32           RxErrCount; /**< malformed datagrams seen */
+} BESOM_IO_Sample_t;
+
+typedef struct
+{
+    BESOM_IO_Sample_t Sample;
+    uint32            RxCount;       /**< firings that carried a NEW sensor block */
+    uint32            RxErrCount;    /**< accessor failures / wrong-sized blocks */
+    uint32            StaleCount;    /**< firings where the harness supplied nothing new */
+    uint32            OverrunCount;  /**< firings dropped because the task had not kept up */
 } BESOM_IO_Payload_t;
 
 typedef struct
@@ -61,8 +85,18 @@ typedef struct
     uint32              RunStatus;
     osal_id_t           TimerId;
     osal_id_t           TimingSem;
-    osal_id_t           SockId;
-    OS_SockAddr_t       SockAddr;
+
+    /*
+     * Written by the timer callback, read by the app task. Write advances only
+     * when a latch is actually stored, and the callback gives the semaphore
+     * exactly once per stored latch -- so the semaphore count and the number of
+     * unread latches stay equal, and the k-th publish always carries the k-th
+     * accepted firing however the task is scheduled.
+     */
+    BESOM_IO_Sample_t Ring[BESOM_IO_RING];
+    volatile uint32   Write;
+    uint32            Read;
+    uint32            LastSeq; /**< sensor_seq of the last block accepted */
 } BESOM_IO_Data_t;
 
 extern BESOM_IO_Data_t BESOM_IO_Data;

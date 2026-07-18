@@ -225,7 +225,6 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     let tlm = UdpSocket::bind(("0.0.0.0", TLM_PORT))
         .with_context(|| format!("binding telemetry port {TLM_PORT}"))?;
     tlm.set_nonblocking(true)?;
-    let sensors = UdpSocket::bind(("0.0.0.0", 0))?;
 
     let mut vehicle = Vehicle::default();
     let mut loop_err = LoopError::default();
@@ -262,7 +261,10 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
         let mut booted = false;
 
         for _i in 0..BOOT_TICKS {
-            clock.step(TICK_USEC)?;
+            // Feed from the very first tick. The sensor rides the step, so this costs no
+            // extra syscall -- and it guarantees the PSP holds a block before besom_io's timer
+            // can ever fire, so there is no startup window in which the app has no sample.
+            clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
             quiesce::wait(cfs.pid());
 
             if !booted && cfs.log_contains("entering OPERATIONAL state") {
@@ -338,7 +340,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     const ENABLE_TICKS: u32 = 200;
     let mut boot_history = Transcript::new();
     for _ in 0..ENABLE_TICKS {
-        clock.step(TICK_USEC)?;
+        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
         quiesce::wait(cfs.pid());
         drain(&tlm, &mut boot_history);
     }
@@ -379,8 +381,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
 
     let mut synced = false;
     for _ in 0..SYNC_LIMIT {
-        let _ = sensors.send_to(&fsw::encode_state(&vehicle), ("127.0.0.1", fsw::STATE_PORT));
-        clock.step(TICK_USEC)?;
+        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
         quiesce::wait(cfs.pid());
         vehicle.step(f64::from(TICK_USEC) / 1e6);
 
@@ -389,6 +390,9 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
 
         if probe.entries().iter().any(|e| e.msg_id == SYNC_MID) {
             synced = true;
+            if std::env::var("BESOM_DEBUG_SAMPLES").is_ok() {
+                eprintln!("SYNCTICK {}", clock.sim_usec());
+            }
             break;
         }
     }
@@ -417,11 +421,10 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     let mut discard = Transcript::new();
 
     for tick in 0..cfg.ticks {
-        // Deliver sensor data BEFORE granting the tick that lets the flight
-        // software look for it.
-        let _ = sensors.send_to(&fsw::encode_state(&vehicle), ("127.0.0.1", fsw::STATE_PORT));
-
-        clock.step(TICK_USEC)?;
+        // The sensor block IS the step. "Deliver state before granting the tick that lets the
+        // flight software look for it" used to be a convention this loop had to remember; now
+        // there is one datagram and the state is in it, so the ordering cannot be got wrong.
+        clock.step_with_sensor(TICK_USEC, &fsw::encode_state(&vehicle, clock.sim_usec()))?;
         quiesce::wait(cfs.pid());
 
         let sink = if tick < record_until { &mut transcript } else { &mut discard };
@@ -465,6 +468,9 @@ fn drain_with_loop(
         let Ok(pkt) = TlmPacket::parse(&buf[..n]) else { continue };
 
         if let Some(f) = FswState::parse(pkt.msg_id, &buf[..n]) {
+            if std::env::var("BESOM_DEBUG_SAMPLES").is_ok() {
+                eprintln!("SAMPLE {} {:.9} {:.9}", f.sample_usec, f.lat_deg, f.lon_deg);
+            }
             let (lat, lon) = vehicle.orbit.subpoint_deg();
             err.max_lat_deg = err.max_lat_deg.max((f.lat_deg - lat).abs());
             err.max_lon_deg = err.max_lon_deg.max((f.lon_deg - lon).abs());
