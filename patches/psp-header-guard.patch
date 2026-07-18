@@ -1,0 +1,28 @@
+Fix a typo'd header guard in nasa/PSP's RTEMS coverage stub.
+
+The opening #ifndef says OVERRIDE_TOOIMPL_H while the #define says
+OVERRIDE_TODIMPL_H (TOO- vs TOD-). GCC's -Werror=header-guard catches the
+mismatch, and cFS builds the PSP coverage targets during `make install` --
+so `make native_std.install` fails outright on any reasonably recent GCC,
+even though nothing Besom touches is involved:
+
+  todimpl.h:20: error: header guard 'OVERRIDE_TOOIMPL_H' followed by
+  '#define' of a different macro [-Werror=header-guard]
+
+This is an upstream nasa/PSP bug, not a Besom one, and it is unrelated to
+the simulated timebase. It is carried here only so the build instructions
+in the README actually complete. Upstreaming it is the real fix.
+
+diff --git a/unit-test-coverage/ut-stubs/override_inc/rtems/score/todimpl.h b/unit-test-coverage/ut-stubs/override_inc/rtems/score/todimpl.h
+index 408b28c..632aa89 100644
+--- a/unit-test-coverage/ut-stubs/override_inc/rtems/score/todimpl.h
++++ b/unit-test-coverage/ut-stubs/override_inc/rtems/score/todimpl.h
+@@ -17,7 +17,7 @@
+  ************************************************************************/
+ 
+ /* PSP coverage stub replacement for todimpl.h */
+-#ifndef OVERRIDE_TOOIMPL_H
++#ifndef OVERRIDE_TODIMPL_H
+ #define OVERRIDE_TODIMPL_H
+ 
+ #include "PCS_todimpl.h"
