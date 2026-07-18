@@ -58,9 +58,26 @@ static bool BESOM_IO_Poll(void)
      *
      * A sensor reports what is true NOW. Discard the backlog and keep the last.
      */
-    while (OS_SocketRecvFrom(BESOM_IO_Data.SockId, &state, sizeof(state), &from, OS_CHECK) ==
-           (int32)sizeof(state))
+    /*
+     * A short or oversized datagram must be COUNTED and SKIPPED, not treated as
+     * end-of-queue.  Testing `== sizeof(state)` in the loop condition made one
+     * malformed datagram end the drain, leaving every valid sample queued behind
+     * it -- the backlog the comment above exists to prevent, reintroduced by the
+     * error path.  It also left RxErrCount permanently 0, so `besomctl loop`'s
+     * "(0 malformed)" was structurally true rather than evidence of anything.
+     *
+     * Only a non-positive return means "nothing left to read".
+     */
+    int32 n;
+
+    while ((n = OS_SocketRecvFrom(BESOM_IO_Data.SockId, &state, sizeof(state), &from, OS_CHECK)) > 0)
     {
+        if (n != (int32)sizeof(state))
+        {
+            ++BESOM_IO_Data.HkTlm.Payload.RxErrCount;
+            continue;
+        }
+
         BESOM_IO_Data.HkTlm.Payload.State = state;
         ++BESOM_IO_Data.HkTlm.Payload.RxCount;
         got = true;
