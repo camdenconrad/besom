@@ -202,6 +202,56 @@ impl Transcript {
         out
     }
 
+    /// Where two runs' packet CONTENTS differ, per MID.
+    ///
+    /// Returns `(msg_id, packets_of_that_mid, packets_that_differ, differing_byte_offsets)`.
+    /// Offsets are unioned across every packet of the MID, because the question being answered is
+    /// "which FIELD of this packet is unstable", not "which packet" -- a counter at a fixed offset
+    /// shows up as one offset however many packets carry it.
+    ///
+    /// This is a diagnostic, not a verdict. Every entry it returns is a field whose value depends
+    /// on something other than simulated time, i.e. a determinism defect to be fixed at source
+    /// before payload comparison can be asserted on (#4). Reporting the offsets is what makes that
+    /// tractable: 9 differing bytes in a 172-byte housekeeping packet is a counter to find, while
+    /// 69 of 92 is a different problem entirely.
+    pub fn payload_differences(&self, other: &Self) -> Vec<(MsgId, usize, usize, Vec<usize>)> {
+        let (a, b) = (self.by_msg_id(), other.by_msg_id());
+        let mut out = Vec::new();
+
+        for (mid, ea) in &a {
+            let Some(eb) = b.get(mid) else { continue };
+            let mut offsets = std::collections::BTreeSet::new();
+            let mut differing = 0usize;
+            let mut compared = 0usize;
+
+            for (x, y) in ea.iter().zip(eb.iter()) {
+                compared += 1;
+                let mut this_differs = false;
+                for (i, (p, q)) in x.payload.iter().zip(y.payload.iter()).enumerate() {
+                    if p != q {
+                        offsets.insert(i);
+                        this_differs = true;
+                    }
+                }
+                // A length change is already a stream failure, but note it rather than silently
+                // comparing only the common prefix.
+                if x.payload.len() != y.payload.len() {
+                    this_differs = true;
+                }
+                if this_differs {
+                    differing += 1;
+                }
+            }
+
+            if differing > 0 {
+                out.push((*mid, compared, differing, offsets.into_iter().collect()));
+            }
+        }
+
+        out.sort_by_key(|(mid, ..)| *mid);
+        out
+    }
+
     /// The largest tick-placement shift between two runs, in ticks.
     pub fn max_shift_ticks(&self, other: &Self) -> f64 {
         self.differences(other)
@@ -255,6 +305,38 @@ mod tests {
         assert_eq!(a.entries()[0].payload, vec![0xAA; 20], "payload must survive into the entry");
         assert_ne!(a.entries()[0].payload, b.entries()[0].payload);
         assert!(a.same_stream(&b), "payload must not yet affect the verdict");
+    }
+
+    #[test]
+    fn payload_differences_names_the_unstable_field_not_the_packet() {
+        // A counter at a fixed offset is ONE unstable field however many packets carry it, so
+        // offsets are unioned across the MID. That is the difference between a work list of
+        // "one counter in ES housekeeping" and one of "seven packets differ".
+        let (mut a, mut b) = (Transcript::new(), Transcript::new());
+        for seq in 1..=3u16 {
+            let mut pa = pkt(0x0800, seq, 100 + u32::from(seq), 0);
+            let mut pb = pkt(0x0800, seq, 100 + u32::from(seq), 0);
+            pa.payload = vec![0; 20];
+            pb.payload = vec![0; 20];
+            pb.payload[7] = 0xFF; // same offset every packet: one field
+            a.record(&pa);
+            b.record(&pb);
+        }
+
+        let d = a.finish().payload_differences(&b.finish());
+        assert_eq!(d.len(), 1, "one MID");
+        let (mid, compared, differing, offsets) = &d[0];
+        assert_eq!(*mid, 0x0800);
+        assert_eq!((*compared, *differing), (3, 3));
+        assert_eq!(offsets, &vec![7], "three packets, one unstable field");
+    }
+
+    #[test]
+    fn payload_differences_is_empty_when_contents_match() {
+        let (mut a, mut b) = (Transcript::new(), Transcript::new());
+        a.record(&pkt(0x0800, 1, 100, 0));
+        b.record(&pkt(0x0800, 1, 100, 0));
+        assert!(a.finish().payload_differences(&b.finish()).is_empty());
     }
 
     #[test]

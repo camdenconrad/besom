@@ -103,6 +103,29 @@ fn main() -> Result<()> {
             let max = a.max_shift_ticks(&b);
             println!("stream reproducible: {} packets, identical", a.len());
 
+            // Payload contents are retained but not yet asserted on (#4), so report them as a
+            // diagnostic. Each line is a field that depends on something other than simulated
+            // time -- the work list for making payload comparison possible, in the order it
+            // matters. Silence here means the transcript is reproducible byte-for-byte.
+            let pdiff = a.payload_differences(&b);
+            if !pdiff.is_empty() {
+                let differing: usize = pdiff.iter().map(|(_, _, d, _)| d).sum();
+                println!(
+                    "payload: {differing}/{} packets differ (not asserted -- see issue #4)",
+                    a.len()
+                );
+                for (mid, compared, diff, offsets) in &pdiff {
+                    let shown: Vec<String> =
+                        offsets.iter().take(12).map(|o| o.to_string()).collect();
+                    let more = if offsets.len() > 12 { ", ..." } else { "" };
+                    println!(
+                        "  {mid:04x}  {diff}/{compared} packets, {} byte(s) at {}{more}",
+                        offsets.len(),
+                        shown.join(",")
+                    );
+                }
+            }
+
             // A quiescence timeout means the harness granted a tick while cFS was still
             // reacting to the previous one -- a host-timed decision. Report it whatever the
             // outcome: a CLEAN run that stalled was lucky, not proven, and saying so is the
