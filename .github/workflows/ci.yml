@@ -47,7 +47,7 @@ jobs:
       # the clone, the submodules and the build entirely.
       - name: Cache cFS build
         id: cfs-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .cfs/build-native_std/exe/cpu1
           key: cfs-${{ env.CFS_REF }}-${{ hashFiles('patches/*.patch', 'cfs/besom_io/**') }}
