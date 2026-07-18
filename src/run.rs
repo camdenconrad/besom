@@ -36,18 +36,26 @@ pub struct Cfs {
 }
 
 impl Cfs {
-    /// Boot cFS with its clock under our control, and wait until its apps have
-    /// come up.
+    /// Launch cFS with its clock under our control, and return as soon as the PSP has bound
+    /// the step socket.
     ///
-    /// The wait is not optional. cFS boot does NOT need the timebase — OSAL
-    /// tasks run on host threads — so it proceeds happily while our clock is
-    /// frozen. If we start stepping before SCH_LAB has called `OS_TimerSet`, the
-    /// whole tick budget burns before its timer is even armed, it never fires,
-    /// and NO telemetry is ever produced. That failure looks exactly like a
-    /// broken timebase and is not one.
+    /// **This does NOT wait for the apps.** It returns while cFS is still coming up, and the
+    /// caller must grant ticks during that window (see the note at the end of this function).
+    /// In particular CI_LAB binds UDP 1234 some time AFTER this returns, so anything uplinked
+    /// straight after `boot` is a datagram to a closed port — dropped in silence, leaving an
+    /// empty sky with no error anywhere. Wait for `"CI_LAB listening on UDP port"` first.
+    ///
+    /// The counterpart hazard, which is why the step socket is the thing waited on: cFS boot
+    /// does NOT need the timebase — OSAL tasks run on host threads — so it proceeds happily
+    /// while our clock is frozen. If we start stepping before SCH_LAB has called
+    /// `OS_TimerSet`, the whole tick budget burns before its timer is even armed, it never
+    /// fires, and NO telemetry is ever produced. That failure looks exactly like a broken
+    /// timebase and is not one.
     pub fn boot(cfg: &Config) -> Result<Self> {
         let _ = std::fs::remove_file(&cfg.step_sock);
         let log = std::env::temp_dir().join(format!("besom-cfs-{}.log", std::process::id()));
+
+        let log_file = std::fs::File::create(&log)?;
 
         let mut cmd = Command::new("./core-cpu1");
         cmd.current_dir(&cfg.cfs_dir)
@@ -60,8 +68,15 @@ impl Cfs {
                 "BESOM_COOP",
                 std::env::var("BESOM_COOP").unwrap_or_else(|_| "1".into()),
             )
-            .stdout(Stdio::from(std::fs::File::create(&log)?))
-            .stderr(Stdio::from(std::fs::File::create(&log)?));
+            // ONE file description, shared. Calling File::create twice on the same path gives
+            // two independent descriptions, each with its own offset and each truncating: cFS's
+            // stdout and stderr then overwrite each other instead of interleaving, and whichever
+            // wrote last wins. Every guard in this file reads that log -- "CI_LAB listening on
+            // UDP port", "TO_LAB 3", "entering OPERATIONAL state" -- so a clobbered line is a
+            // guard that waits for something already written and then times out, or worse,
+            // misses the race it exists to catch. try_clone shares the offset.
+            .stdout(Stdio::from(log_file.try_clone()?))
+            .stderr(Stdio::from(log_file));
 
         // Have the kernel kill cFS if we die, however we die.
         //
@@ -162,6 +177,14 @@ pub struct LoopError {
     pub last: Option<FswState>,
 }
 
+/// Ticks granted past the end of the recorded window, whose packets are thrown away.
+///
+/// At least one full period of the SLOWEST periodic stream. cFE TIME's 1 Hz tone is the
+/// slowest thing driving telemetry, so anything less than 100 ticks cannot stabilise the
+/// edge -- a shorter guard leaves the last 1 Hz cycle half in and half out, and the packet
+/// count wobbles.
+pub const GUARD: u32 = 120;
+
 /// Boot cFS, enable its downlink, step the clock, and record the telemetry.
 pub fn run(cfg: &Config) -> Result<Transcript> {
     Ok(run_with_loop(cfg)?.0)
@@ -170,6 +193,19 @@ pub fn run(cfg: &Config) -> Result<Transcript> {
 /// As [`run`], but also feeds simulated vehicle state to the `besom_io` app and
 /// measures how faithfully the flight software reports it back.
 pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
+    // A budget inside the guard band records NOTHING, and an empty transcript is not a
+    // reproducible one -- it is an unasked question. Two empty transcripts compare equal, so
+    // `check` would print "0 packets, identical" / "tick placement: identical" and exit 0,
+    // passing just as happily with the downlink dead. Refuse the run instead of answering
+    // vacuously.
+    if cfg.ticks <= GUARD {
+        bail!(
+            "tick budget {} is inside the {GUARD}-tick guard band, so nothing would be \
+             recorded -- use more than {GUARD} ticks",
+            cfg.ticks
+        );
+    }
+
     let cfs = Cfs::boot(cfg)?;
     let mut clock = Clock::connect(&cfg.step_sock)?;
 
@@ -196,7 +232,20 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     // So step a fixed budget: enough for any boot, and identical every run.
     const BOOT_TICKS: u32 = 4000;
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        // A WALL-CLOCK backstop, not a simulated one: it exists so a wedged cFS fails instead
+        // of hanging forever. It bounds nothing about the run's content.
+        //
+        // It is tunable because it is the one place where buying determinism with wall-clock
+        // collides with a fixed wall-clock budget. Widening the quiescence confirmation window
+        // (`$BESOM_QUIESCE_SAMPLES`) multiplies through all 4000 boot ticks -- 20 samples at
+        // 400us is ~32s of extra polling before cFS has even finished booting -- so a value
+        // that was generous at the default becomes a spurious "boot timed out" on a loaded
+        // host. Raise both together, or the harness fails for the wrong reason.
+        let boot_timeout = std::env::var("BESOM_BOOT_TIMEOUT_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        let deadline = Instant::now() + Duration::from_secs(boot_timeout);
         let mut booted = false;
 
         for _i in 0..BOOT_TICKS {
@@ -210,7 +259,12 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
                 }
             }
             if Instant::now() > deadline {
-                bail!("cFS boot timed out");
+                bail!(
+                    "cFS boot timed out after {boot_timeout}s of wall clock \
+                     (raise $BESOM_BOOT_TIMEOUT_S; a wide $BESOM_QUIESCE_SAMPLES costs \
+                     ~{}s of polling across {BOOT_TICKS} boot ticks)",
+                    quiesce::confirm_window().as_millis() * u128::from(BOOT_TICKS) / 1000
+                );
             }
         }
 
@@ -222,21 +276,65 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
         }
     }
 
-    // Enable the downlink -- with the clock frozen, so it takes effect at an exact
-    // simulated instant. Sending it while stepping means CI_LAB picks it up at a
-    // host-scheduling-dependent moment and the run stops being reproducible.
+    // BRING UP THE DOWNLINK. Two hazards, and they pull in opposite directions.
     //
-    // The command path itself needs no ticks: CI_LAB reads its socket on an
-    // ordinary host task.
+    // DO NOT UPLINK BEFORE CI_LAB HAS BOUND ITS PORT. `Cfs::boot` returns as soon as the PSP
+    // binds the step socket -- it does NOT wait for the apps. CI_LAB binds UDP 1234 some time
+    // later, and a command sent into that gap is a datagram to a closed port: dropped, in
+    // silence. TO_LAB then sits at "Awaiting enable command" forever, nothing is downlinked,
+    // and cFS, the timebase and the tick stream all look healthy -- an empty sky, no error.
+    // The bind itself happens on a host thread during app init, so waiting for it costs no
+    // simulated time.
+    //
+    // DO NOT WAIT FOR THE ACK WITH THE CLOCK FROZEN. By this point the boot loop has granted
+    // ticks, so OS_SimTime is ACTIVE. CI_LAB's loop is
+    //     CFE_SB_ReceiveBuffer(&buf, CommandPipe, 500ms)   // 500ms = 50 ticks, simulated
+    //     ... CI_LAB_ReadUpLink()                          // only reached after that returns
+    // and under the OSAL patch a timed receive with simulated time active parks until
+    // SIMULATED time reaches its deadline. With the clock frozen CI_LAB can never wake, never
+    // polls its socket, and TO_LAB never emits EID 3 -- so waiting for the ack without
+    // granting time is unsatisfiable by construction, and hangs every run until it bails.
+    //
+    // So grant time, but a FIXED amount: enough for several CI_LAB wakeups, and identical on a
+    // fast host and a slow one, so the handshake costs the same simulated time every run.
+    //
+    // Note what this corrects about the older comment here. It claimed the enable took effect
+    // "at an exact simulated instant" because the clock was frozen. It did not: the guard
+    // waited on "TO_LAB 19", a BOOT event already in the log, so it passed vacuously and the
+    // datagram simply sat in the kernel socket buffer until the phase-align loop below started
+    // granting ticks. The enable was always applied whenever ticks resumed -- that is now
+    // explicit, bounded, and actually verified.
+    cfs.await_log("CI_LAB listening on UDP port", Duration::from_secs(10))
+        .context("CI_LAB never bound its command port")?;
+
     let mut ip = [0u8; 16];
     ip[..9].copy_from_slice(b"127.0.0.1");
     let enable = build_command(TO_LAB_CMD_MID, TO_LAB_OUTPUT_ENABLE_CC, &ip);
-    UdpSocket::bind(("0.0.0.0", 0))?.send_to(&enable, ("127.0.0.1", CI_PORT))?;
+    let uplink = UdpSocket::bind(("0.0.0.0", 0))?;
+    uplink.send_to(&enable, ("127.0.0.1", CI_PORT))?;
 
-    // TO_LAB event 19 = "TO Lab subscribed to N messages from the table".
-    cfs.await_log("TO_LAB 19", Duration::from_secs(10))
-        .context("TO_LAB never acknowledged the enable command")?;
-    quiesce::wait(cfs.pid());
+    // 4x CI_LAB's 50-tick receive timeout: several chances to wake, still a fixed cost.
+    //
+    // DRAIN AS WE GO. TO_LAB starts downlinking the moment the enable lands, so these ticks
+    // produce telemetry -- and leaving it to accumulate undrained puts it in the kernel's
+    // receive buffer, where overflow is decided by socket memory rather than by the flight
+    // software. Granting 200 ticks without draining lost packets nondeterministically: `check`
+    // went from 15/15 identical to 89/382 packets moved ON AN IDLE HOST. This is boot history,
+    // so it is discarded -- but it must be discarded by US, deterministically, not by the
+    // kernel dropping whatever did not fit.
+    const ENABLE_TICKS: u32 = 200;
+    let mut boot_history = Transcript::new();
+    for _ in 0..ENABLE_TICKS {
+        clock.step(TICK_USEC)?;
+        quiesce::wait(cfs.pid());
+        drain(&tlm, &mut boot_history);
+    }
+
+    // A REAL guard. TO_LAB_TLMOUTENA_INF_EID (3) is the enable itself, not a boot event, so
+    // this fails loudly on a lost command instead of flying blind.
+    if !cfs.log_contains("TO_LAB 3") {
+        bail!("TO_LAB never acknowledged the enable-output command; there would be no downlink");
+    }
 
     // Subscribe besom_io's telemetry: TO_LAB's table is baked in at build time.
     let up = UdpSocket::bind(("0.0.0.0", 0))?;
@@ -299,11 +397,7 @@ pub fn run_with_loop(cfg: &Config) -> Result<(Transcript, LoopError)> {
     // So keep stepping for a further GUARD ticks and throw those packets away.
     // The recorded window then ends at a simulated time we chose, and the packet
     // counts are stable.
-    // At least one full period of the SLOWEST periodic stream. cFE TIME's 1 Hz
-    // tone is the slowest thing driving telemetry, so anything less than 100
-    // ticks cannot stabilise the edge -- a shorter guard leaves the last 1 Hz
-    // cycle half in and half out, and the packet count wobbles.
-    const GUARD: u32 = 120;
+    // See GUARD.
     let record_until = cfg.ticks.saturating_sub(GUARD);
 
     let mut transcript = Transcript::new();
