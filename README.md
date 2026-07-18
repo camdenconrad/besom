@@ -96,9 +96,68 @@ runs, which is the run's edge moving, not the software behaving differently.
 
 **Under `BESOM_COOP=0`, assert on the stream and never on tick placement.** Host scheduling gives you
 the stream guarantee only, and a placement assertion there is an assertion about Linux's scheduler.
-`Transcript::same_stream` is that weaker check: it still catches every real defect — a dropped packet,
-a duplicate, a wrong size, a reordering, a wrong value. With coop scheduling on (the default),
-`besomctl check` holds both, and fails on a difference in either.
+`Transcript::same_stream` is that weaker check: it catches a dropped packet, a duplicate, a wrong
+size, a reordering. With coop scheduling on (the default), `besomctl check` holds both, and fails on
+a difference in either.
+
+**It does not catch a wrong value.** `Entry::stream_key` is `(msg_id, seq_delta, len)`, and
+`TlmPacket` parses only the 12-byte CCSDS header — no payload byte is ever retained, so a packet
+whose contents are wrong but whose length is unchanged is invisible to the comparison. An app that
+publishes a stale latitude or a wrong counter passes `check` today. Payload comparison is the single
+most valuable thing to add next, and it is not a small change: it needs a rule for fields that may
+legitimately differ before it can be asserted on.
+
+Two narrower gaps in the same comparison, both real:
+
+* A packet dropped at the **leading** edge of a MID's stream is forgiven. The first packet of each
+  MID is recorded with `seq_delta: None`, so losing it promotes the next one into that slot and the
+  prefix realigns; the length difference of one is then absorbed by the trailing-boundary tolerance.
+  The guard band pins the trailing edge only.
+* `besomctl check N` for `N <= 120` used to record nothing and report it as reproducible. Two empty
+  transcripts compare equal, so it printed `0 packets, identical` and exited 0 — the same green
+  result a dead downlink would give. Budgets inside the guard band are now refused outright.
+
+### Host load is the one thing that still gets in
+
+Reproducibility was measured against the two ways a CI runner differs from a workstation — how many
+cores it has, and how busy they are. 15 trials per condition, 3000 ticks, `BESOM_COOP=1`:
+
+| condition | placement identical |
+|---|---|
+| idle, 16 cores | 15/15 |
+| idle, 2 cores | 15/15 |
+| loaded, 16 cores | 14/15 |
+| loaded, 2 cores | 11/15 (one failed outright) |
+
+**Core count is not the problem.** Pinned to two cores — a runner's shape — placement held 15/15 on
+the same 382 packets. Besom does not need a big machine.
+
+**Contention is.** And every failure has the same shape: about a quarter of the stream moved, by a
+maximum of *exactly* 10 ticks. Not jitter — one discrete one-cycle phase slip in `besom_io` (10 Hz
+= 10 ticks), after which the affected streams are stamped one cycle over.
+
+The leak is the harness's own, and it is not the obvious one. Tick placement is stamped from the
+packet's own cFE header — simulated time, frozen for a whole granted tick — so intra-tick
+scheduling noise *cannot* move a packet between ticks. Only a decision at a tick boundary can, and
+that decision is `quiesce::wait`.
+
+The natural suspect is its deadline: it gives up after `$BESOM_QUIESCE_MS` and grants the next
+tick anyway. **Measurement refuted that** — under load, shifts happen with `timeouts() == 0`. The
+deadline is never reached, so raising it does nothing.
+
+`wait` returns after 3 consecutive samples showing no runnable cFS thread, polled every 400 µs — a
+1.2 ms confirmation window. Under contention the lag between granting a tick and the woken thread
+actually being marked `R` exceeds that window, so all three samples come up clean and the harness
+declares quiescence *before cFS has begun reacting*. A false quiescence, and unlike an expiry it
+increments nothing: `stalls == 0` is not evidence the harness behaved, only that it did not
+notice. `$BESOM_QUIESCE_SAMPLES` exposes the window.
+
+`check` now separates the two ways placement can differ: **NOT REPRODUCIBLE** (placement moved,
+quiescence clean) from **INCONCLUSIVE** (placement moved and the harness stalled — the host was too
+busy for the run to mean anything). Conflating those is how a determinism harness earns a
+reputation for flakiness and then gets ignored.
+
+Full method and numbers: [docs/determinism-under-load.md](docs/determinism-under-load.md).
 
 ## Closing the loop
 
@@ -137,6 +196,12 @@ cp -r /path/to/besom/cfs/besom_io cFS/apps/besom_io
 git -C cFS/psp  apply /path/to/besom/patches/psp-timebase-besom.patch
 git -C cFS/osal apply /path/to/besom/patches/osal-simulated-time.patch
 git -C cFS      apply /path/to/besom/patches/cfs-mission-config.patch
+
+# Not a Besom change: nasa/PSP has a typo'd header guard (OVERRIDE_TOOIMPL_H vs
+# OVERRIDE_TODIMPL_H) in an RTEMS coverage stub. cFS builds the coverage targets during
+# `make install`, so -Werror=header-guard fails the build on any recent GCC. Carried here
+# only so these instructions complete; it belongs upstream.
+git -C cFS/psp  apply /path/to/besom/patches/psp-header-guard.patch
 
 cd cFS
 CMAKE_POLICY_VERSION_MINIMUM=3.5 make native_std.install   # cmake ≥4 needs the policy shim

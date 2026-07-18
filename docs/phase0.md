@@ -28,7 +28,11 @@ natively on this box**:
 
 `psp/unit-test-coverage/ut-stubs/override_inc/rtems/score/todimpl.h:20` has a typo'd header
 guard — `#ifndef OVERRIDE_TOOIMPL_H` vs `#define OVERRIDE_TODIMPL_H`. Invisible until gcc's
-`-Werror=header-guard`. One-line fix to `nasa/PSP`. Fixed locally; **not yet upstreamed.**
+`-Werror=header-guard`. One-line fix to `nasa/PSP`. **Not yet upstreamed.**
+
+It is not optional: cFS builds the PSP coverage targets during `make install`, so a fresh
+checkout following the README's build instructions fails outright on any recent GCC. It now
+ships as `patches/psp-header-guard.patch` and is applied alongside the other three.
 
 ---
 
@@ -277,6 +281,16 @@ Consequences, handled differently:
   a byte-deterministic cFS.
 
 ### What to assert in a regression harness (do this)
+
+> **Superseded — read this as phase-0 history, not as current guidance.** Two of the claims
+> below no longer describe the shipped harness:
+>
+> * *"catches every real defect ... a wrong value"* is **false and always was**.
+>   `Entry::stream_key` is `(msg_id, seq_delta, len)` and `TlmPacket` parses only the CCSDS
+>   header, so no payload byte is retained and a wrong value is invisible. See the README.
+> * *"Do not assert on tick placement"* was correct **before the cooperative scheduler**. With
+>   `BESOM_COOP=1` placement is a guarantee and `besomctl check` fails on it. Under
+>   `BESOM_COOP=0` the advice below still stands exactly as written.
 
 Assert on the **stream** — per MID: packet count, sequence-deltas, lengths. It is exactly
 reproducible and it catches every real defect: a dropped packet, a duplicate, a wrong size, a
