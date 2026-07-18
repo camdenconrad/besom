@@ -59,6 +59,19 @@ impl Cfs {
 
         let mut cmd = Command::new("./core-cpu1");
         cmd.current_dir(&cfg.cfs_dir)
+            // FORCE A POWER-ON RESET. Without this, a run inherits the previous run's state.
+            //
+            // cFE's PSP keeps its reserved memory alive between processes, so the SECOND run of
+            // `check` finds it valid and comes up as a PROCESSOR reset while the first came up
+            // power-on. Measured across two runs of the same scenario: ResetType 2 vs 1,
+            // ProcessorResets 0 vs 1, ERLogEntries 1 vs 2, SysLogEntries 39 vs 76.
+            //
+            // The packet stream and tick placement do not notice, which is why this hid until
+            // payloads were compared -- but "run the same scenario twice" was quietly running
+            // two different scenarios, and any app that behaves differently after a processor
+            // reset (checking its CDS, restoring state) would have been tested asymmetrically.
+            .arg("-R")
+            .arg("PO")
             .env("BESOM_STEP_SOCK", &cfg.step_sock)
             // Cooperative deterministic scheduling is ON by default: it is what
             // makes tick placement reproducible, not just the packet stream. Set
