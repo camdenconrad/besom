@@ -140,6 +140,24 @@ recording a guard band before you stop granting time. Both ends pinned to the sa
 Set `BESOM_COOP=0` to fall back to host scheduling: faster, but then only the *stream* is guaranteed,
 not tick placement.
 
+**What cannot run cooperatively.** Code that waits for *many* ticks of mission time while holding
+exclusive execution deadlocks under `BESOM_COOP=1`, and this is structural rather than a bug. The
+acknowledgement for a tick is sent when the PSP re-enters its sync call — that is what proves the
+previous tick was fully dispatched — and re-entering needs the cooperative token. So exactly one
+tick can be in flight. A task that spins until the clock advances is therefore waiting for
+something that cannot happen until it yields.
+
+cFS's own `cfe_testcase` suite contains one: `sb_performance_test` calibrates CPU speed by spinning
+until `CFE_PSP_GetTime` advances 100 ms. Perfectly reasonable against a real clock, unsatisfiable
+against a granted one. `besomctl` detects the missing acknowledgement and says so, naming the cause
+rather than reporting a bare socket timeout, and cFS's log carries `COOP-STALL` lines identifying
+the task holding the token.
+
+Such workloads run fine under `BESOM_COOP=0`, where the timebase thread is not gated by the token —
+you keep the stream guarantee and lose tick-placement determinism. The alternative would be to
+acknowledge a tick on consumption rather than on completion, which would make every run
+irreproducible; that trade is not worth making for a benchmark.
+
 Within a single granted tick, cFE's tasks are *simultaneous* in simulated time. Left to the host
 scheduler, *which* of them runs first is Linux's choice, and placement jitters for a minority of
 packets: *what* the flight software does would be deterministic, *when* it does it would not. Closing

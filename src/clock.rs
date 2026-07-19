@@ -97,10 +97,33 @@ impl Clock {
             .with_context(|| format!("sending step to {}", self.psp_path.display()))?;
 
         let mut reply = [0u8; 8];
-        let (n, _) = self
-            .sock
-            .recv_from(&mut reply)
-            .context("cFS did not acknowledge the step (is it running on timebase_besom?)")?;
+        let (n, _) = self.sock.recv_from(&mut reply).with_context(|| {
+            // A missing ack has two very different causes and they need different answers.
+            //
+            // The ack for THIS step is sent at the entry of the PSP's NEXT sync call -- that is
+            // what proves the previous tick was fully dispatched. Re-entering that call needs the
+            // cooperative token. So under BESOM_COOP=1 a task that busy-waits on the mission clock
+            // while holding the token deadlocks the run outright: exactly one tick can be granted,
+            // the ack never comes, and time can never reach whatever the task is waiting for.
+            //
+            // That is structural, not a bug to be fixed here. Any wait that needs MANY ticks to
+            // pass while holding exclusive execution cannot make progress cooperatively. cFS's own
+            // cfe_testcase suite contains one (sb_performance_test calibrates CPU speed by
+            // spinning until CFE_PSP_GetTime advances 100 ms). Such code runs fine under
+            // BESOM_COOP=0, where the timebase thread is not gated by the token.
+            if std::env::var("BESOM_COOP").unwrap_or_else(|_| "1".into()).starts_with('1') {
+                "cFS did not acknowledge the step.\n\
+                 With BESOM_COOP=1 this usually means a task is waiting on the mission clock while \
+                 holding the cooperative token: only one tick can be in flight, so the clock cannot \
+                 reach what the task is waiting for and the run deadlocks. Look for COOP-STALL \
+                 lines in cFS's log -- they name the task holding the token.\n\
+                 Code that spins or sleeps across many ticks cannot run cooperatively; re-run with \
+                 BESOM_COOP=0 to get the stream guarantee without tick-placement determinism."
+                    .to_string()
+            } else {
+                "cFS did not acknowledge the step (is it running on timebase_besom?)".to_string()
+            }
+        })?;
         anyhow::ensure!(n == 8, "malformed step ack: {n} bytes");
 
         self.sim_usec = u64::from_le_bytes(reply);
