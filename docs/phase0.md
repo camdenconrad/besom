@@ -348,6 +348,29 @@ simulated time but its tick source is wall-paced and fire-and-forget, so run-to-
 is not achievable and is not claimed. Besom's step protocol blocks until cFS acknowledges, and the
 harness withholds the next tick until the flight software has gone quiet.
 
+### Prior art that DOES solve the mechanism: TrickCFS
+
+Verified by reading `nasa/trickcfs`, and it retires any claim of novelty for the approach itself:
+
+- `psp/fsw/Trick-pc-linux/src/cfe_psp_timebase_posix_clock.c` sources cFE time from Trick's
+  executive via `exec_get_time_tics()`, announcing *"Using Trick executive clock as CFE timebase"*.
+  `osal/src/os/Trick-posix/src/os-impl-posix-gettime.c` reads the same clock.
+- The timed-wait primitives are taken over as well, not just the tick source:
+  `OS_TaskDelay_Impl` is one line, `SCH_TRICK_schedule_delay(taskId, millisecond)`, and the queue
+  layer is replaced with `TrickCFSQueue_*`.
+- `SCH_TRICK_mark_pipe_as_complete` gives the executive a completion signal per pipe.
+
+That is the same three-part shape this document works out from scratch — simulated timebase,
+OSAL primitives that cannot escape it, and a way to know when the flight software is done. The
+phase-0 framing that closing the timed-wait gap would be "genuinely novel" was wrong; it had been
+done, by JSC, against a different simulation executive.
+
+What is NOT there, checked by grepping the whole repository: any claim of determinism or
+reproducibility, and any test that runs a scenario twice and compares. TrickCFS synchronises cFS to
+a vehicle simulation; it does not sell a diffable transcript. That distinction is the whole of
+Besom's remaining ground, and it is a claim about the CONTRACT and the tooling around it — check,
+guard band, phase alignment, quiescence accounting — not about having discovered the seam.
+
 ## Gotchas found the hard way (do not re-learn these)
 
 - **Startup race — cost the most time.** cFS boot does NOT need the timebase (OSAL tasks run on

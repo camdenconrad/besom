@@ -52,6 +52,35 @@ Besom's clock does not move until the harness says so, and the harness does not 
 has stopped reacting to the previous tick. That is the whole difference, and it is why two runs can
 be compared byte-for-byte instead of within a tolerance.
 
+### TrickCFS got there first
+
+[TrickCFS](https://github.com/nasa/trickcfs) synchronises cFS with NASA's Trick simulation
+executive, and it is closer to this design than anything else I found. Read before claiming
+novelty:
+
+* Its PSP timebase reads Trick's clock, not the host's — `exec_get_time_tics()` in
+  `psp/fsw/Trick-pc-linux/src/cfe_psp_timebase_posix_clock.c`, printing *"Using Trick executive
+  clock as CFE timebase"* on init. `os-impl-posix-gettime.c` does the same.
+* It takes over the timed-wait primitives too, which is the half most attempts miss:
+  `OS_TaskDelay_Impl` is `SCH_TRICK_schedule_delay(taskId, millisecond)` — handed to Trick's
+  scheduler, not `clock_nanosleep`. The queue layer is replaced outright (`TrickCFSQueue_*`).
+* It has a completion-synchronisation mechanism, `SCH_TRICK_mark_pipe_as_complete`, so the
+  executive knows when a pipe is done rather than assuming.
+
+So "drive cFS from a simulated executive clock, and fix the OSAL primitives that would otherwise
+escape it" is **not** a novel idea, and this project did not invent it.
+
+What is different is the purpose, and therefore the contract. TrickCFS exists to couple cFS to an
+integrated vehicle simulation; I found no claim of run-to-run reproducibility anywhere in the
+repository and no test comparing two runs. Besom exists to make the transcript diffable, which is a
+narrower goal that buys a stronger guarantee: identical packets on identical ticks, asserted by
+`besomctl check`, and CI that fails when it stops being true. The cost side differs too — TrickCFS
+needs Trick, a large simulation framework in its own right, where Besom is a standalone binary and
+four patches.
+
+If you are already a Trick shop, use TrickCFS. Besom is for the case where you want reproducible
+cFS regression tests on a laptop without adopting a simulation environment to get them.
+
 Credit where due: NOS3 is far ahead of Besom on nearly everything else — roughly twenty simulated
 components speaking real UART, I2C, SPI and CAN, [42](https://github.com/ericstoneking/42) for
 dynamics, four ground-system options, and a packaged container. It is a fuller simulator. It is not
